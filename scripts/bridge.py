@@ -15,7 +15,8 @@ which the app runs itself. `watch` reads the thread's rollout file, which Codex
 writes for every thread, so it streams app-held threads too.
 
 CLAUDE -> CODEX
-  bridge.py start "prompt" [--title T] [--cwd D] [--model M] [--effort E] [--from local_<id>] [--no-watch]
+  bridge.py start "prompt" --role ROLE --cwd D [--title T] [--from local_<id>] [--no-watch]
+                     [--sandbox {workspace-write,read-only} | --full-access] [--no-network]
   bridge.py send <thread> "prompt" [--model M] [--effort E] [--no-watch]   unheld: new turn; held: queued
   bridge.py watch <thread> [--timeout S] [--from-start]   stream until the current turn ends
   bridge.py steer <thread> "text"            add input to the running turn (bridge-held threads)
@@ -82,7 +83,11 @@ INSTRUCTIONS = ("This task was dispatched by a Claude Code session, not typed by
                 "send_to_claude instead. Every time you tell the user about a thread or session, give its "
                 "clickable link: a Claude Code session as claude://claude.ai/epitaxy/<local_id>, a Codex "
                 "thread as codex://threads/<id>. Stop and ask with send_to_claude before accepting new "
-                "terms, paying, or granting account access (OAuth).")
+                "terms, paying, or granting account access (OAuth). Without explicit authorization in the "
+                "task text, do not commit, push, merge, deploy, delete, install, change credentials, or "
+                "message families or students, and do not write to Abalar, XADE, or Moodle. Keep student "
+                "data inside the approved circuit and never put it in logs, commits, or published artifacts. "
+                "No datos de alumnado fuera del circuito aprobado ni en logs, commits o artefactos publicados.")
 
 
 def now():
@@ -130,6 +135,67 @@ def save_thread(tid, **kw):
     tmp = THREADS.with_suffix(f".{os.getpid()}.tmp")
     tmp.write_text(json.dumps(d, indent=1))
     tmp.replace(THREADS)
+
+
+def normalize_cwd(value):
+    """Devuelve un directorio existente, absoluto y normalizado."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("--cwd debe ser un directorio existente no vacío")
+    try:
+        cwd = Path(value).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise ValueError(f"--cwd no es un directorio existente: {value!r}") from exc
+    if not cwd.is_dir():
+        raise ValueError(f"--cwd no es un directorio existente: {value!r}")
+    return cwd
+
+
+def route_model(role):
+    """Resuelve provider, modelo y esfuerzo mediante el router canónico, sin fallback."""
+    command = ["uv", "run", "python3", str(Path.home() / ".dotfiles/ai/scripts/model-routing.py"),
+               "--role", role, "--format", "json"]
+    try:
+        result = subprocess.run(command, cwd=Path.home() / ".dotfiles/ai", stdin=subprocess.DEVNULL,
+                                capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ValueError(f"fallo del router canónico: {exc}") from exc
+    if result.returncode:
+        detail = (result.stderr or result.stdout or "sin detalle").strip()
+        raise ValueError(f"fallo del router canónico: {detail[:300]}")
+    try:
+        routed = json.loads(result.stdout)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("el router canónico devolvió JSON inválido") from exc
+    if not isinstance(routed, dict):
+        raise ValueError("el router canónico no devolvió un objeto JSON")
+    if routed.get("provider") != "openai":
+        raise ValueError(f"proveedor del router no permitido: {routed.get('provider')!r}")
+    model, effort = routed.get("model"), routed.get("effort")
+    if not isinstance(model, str) or not model.strip():
+        raise ValueError("el router canónico no devolvió un modelo válido")
+    if not isinstance(effort, str) or not effort.strip():
+        raise ValueError("el router canónico no devolvió un esfuerzo válido")
+    return {"provider": "openai", "model": model.strip(), "effort": effort.strip()}
+
+
+def execution_policy(cwd, sandbox=None, full_access=False, no_network=False):
+    """Construye las formas de sandbox aceptadas por thread/start y turn/start."""
+    if full_access and no_network:
+        raise ValueError("--no-network no es compatible con --full-access")
+    if full_access:
+        mode = "danger-full-access"
+    else:
+        mode = sandbox or "workspace-write"
+    if mode == "workspace-write":
+        network_access = not no_network
+        return mode, network_access, {"sandbox_workspace_write.network_access": network_access}, {
+            "type": "workspaceWrite", "networkAccess": network_access, "writableRoots": [str(cwd)]
+        }
+    if mode == "read-only":
+        return mode, False, {}, {"type": "readOnly", "networkAccess": False}
+    if mode == "danger-full-access":
+        return mode, True, {}, {"type": "dangerFullAccess"}
+    raise ValueError(f"sandbox no permitido: {mode!r}")
 
 
 # ---------------------------------------------------------------- app server
@@ -601,12 +667,21 @@ def call_held(c, method, params):
     return r
 
 
-def turn_params(tid, text, a):
+def turn_params(tid, text, a, policy=None, allow_overrides=True):
     p = {"threadId": tid, "input": [{"type": "text", "text": text}]}
-    if getattr(a, "model", None):
-        p["model"] = a.model
-    if getattr(a, "effort", None):
-        p["effort"] = a.effort
+    stored = policy if policy is not None else load_threads().get(tid, {})
+    if stored.get("sandbox") and stored.get("cwd"):
+        _, _, _, sandbox_policy = execution_policy(
+            Path(stored["cwd"]), sandbox=stored["sandbox"],
+            no_network=not stored.get("network_access", True),
+        )
+        p["sandboxPolicy"] = sandbox_policy
+    model = (getattr(a, "model", None) if allow_overrides else None) or stored.get("model")
+    effort = (getattr(a, "effort", None) if allow_overrides else None) or stored.get("effort")
+    if model:
+        p["model"] = model
+    if effort:
+        p["effort"] = effort
     return p
 
 
@@ -623,13 +698,31 @@ def set_title(c, tid, title):
 
 
 def cmd_start(c, a):
-    r = ok(c.call("thread/start", {"cwd": a.cwd, "dynamicTools": [TOOL], "developerInstructions": INSTRUCTIONS}),
-           "thread/start")
+    try:
+        cwd = normalize_cwd(a.cwd)
+        mode, network_access, config, _ = execution_policy(
+            cwd, sandbox=getattr(a, "sandbox", None), full_access=getattr(a, "full_access", False),
+            no_network=getattr(a, "no_network", False),
+        )
+        route = route_model(a.role)
+    except (AttributeError, ValueError) as exc:
+        emit(f"FAILED: start no autorizado: {exc}")
+        return 5
+    thread_params = {
+        "cwd": str(cwd), "dynamicTools": [TOOL], "developerInstructions": INSTRUCTIONS,
+        "sandbox": mode, "approvalPolicy": "never", "model": route["model"],
+    }
+    if config:
+        thread_params["config"] = config
+    r = ok(c.call("thread/start", thread_params), "thread/start")
     tid = r["thread"]["id"]
-    save_thread(tid, **{"from": a.sender, "title": a.title})
+    policy = {"from": a.sender, "title": a.title, "role": a.role, "cwd": str(cwd), "sandbox": mode,
+              "network_access": network_access, "model": route["model"], "effort": route["effort"]}
+    save_thread(tid, **policy)
     emit(f"THREAD {tid} codex://threads/{tid}")
     append(LOG, {"event": "start", "thread": tid, "from": a.sender, "title": a.title})
-    turn = ok(c.call("turn/start", turn_params(tid, a.prompt, a)), "turn/start")["turn"]["id"]
+    turn = ok(c.call("turn/start", turn_params(tid, a.prompt, a, policy=policy, allow_overrides=False)),
+              "turn/start")["turn"]["id"]
     if a.title:
         set_title(c, tid, a.title)
     if a.section:
@@ -1082,9 +1175,14 @@ def main():
     E = ["minimal", "low", "medium", "high", "xhigh"]
 
     p = sub.add_parser("start"); p.add_argument("prompt"); p.add_argument("--title"); p.add_argument("--section")
-    p.add_argument("--cwd", default=str(Path.home()))
+    p.add_argument("--role", required=True)
+    p.add_argument("--cwd", required=True)
     p.add_argument("--from", dest="sender", default=os.environ.get("CLAUDE_CODE_HOST_SESSION_ID"))
-    p.add_argument("--model"); p.add_argument("--effort", choices=E); p.add_argument("--timeout", type=int, default=3300)
+    sandbox = p.add_mutually_exclusive_group()
+    sandbox.add_argument("--sandbox", choices=("workspace-write", "read-only"))
+    sandbox.add_argument("--full-access", action="store_true")
+    p.add_argument("--no-network", action="store_true")
+    p.add_argument("--timeout", type=int, default=3300)
     p.add_argument("--no-watch", action="store_true")
     p = sub.add_parser("send"); p.add_argument("thread"); p.add_argument("prompt"); p.add_argument("--model")
     p.add_argument("--effort", choices=E); p.add_argument("--timeout", type=int, default=3300)
