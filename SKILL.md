@@ -61,13 +61,15 @@ Un agente de Codex usa el mismo script desde su shell.
 | Ver sesiones de Claude | `/usr/bin/python3 $B claude-list` (estado, nombre, ids `local_`) |
 | Enviar a una sesión | `/usr/bin/python3 $B to-claude --to "<name or local_id>" "message" --thread <your thread id>` |
 | Leer una sesión | `/usr/bin/python3 $B claude-read <name or local_id> [--last N]` |
-| Iniciar una sesión de Claude | `/usr/bin/python3 $B claude-start "prompt" --cwd <dir>`; continuar con `claude --bg --resume <id> "msg"` y detener con `claude stop <id>` |
+| Iniciar una sesión visible de Claude | `/usr/bin/python3 $B claude-start "prompt" --cwd <dir> [--name N] [--no-remote-control] [--notify]`; queda registrada en `claude-started.jsonl` |
+| Ver sesiones iniciadas desde Codex | `/usr/bin/python3 $B claude-started [--last N]` (estado actual, URL y reanudación) |
 | Responder a quien despachó la tarea | Usa la herramienta `send_to_claude` si está disponible; si no, `to-claude` |
 
 ## Límites
 
 - Escribir en una sesión de Claude pasa por el relay. El bridge nunca escribe en su socket privado; un agente de Codex no puede hacerse pasar por una sesión de Claude y cada mensaje identifica su hilo de origen.
-- Las sesiones de Claude en segundo plano (`claude-start`) aparecen en `claude agents`, no en la barra lateral de la aplicación.
+- `claude-start` usa un nombre neutro `codex HH:MM <4 primeros del thread>` si no se indica `--name`; nunca deriva el nombre ni el registro del prompt. Activa Remote Control por defecto y deja una línea `CLAUDE-STARTED` con la URL de `claude.ai` cuando está disponible. `--no-remote-control` lo desactiva.
+- Las sesiones iniciadas con `claude-start` aparecen en `claude agents` y quedan visibles para Adri mediante la URL registrada; `claude-started` cruza el registro local con su estado actual.
 - Los hilos abiertos por la aplicación aceptan mensajes en cola sin la ruta de aplicación, pero no `steer` ni `stop`. Si la aplicación pierde el puerto tras una actualización o relanzamiento, vuelve a ejecutar `app-connect`.
 - Cada sesión de Claude iniciada desde Codex usa el plan de Claude correspondiente.
 - `codex exec` desde un script puede quedarse bloqueado sin `stdin=subprocess.DEVNULL`; pásalo con timeout.

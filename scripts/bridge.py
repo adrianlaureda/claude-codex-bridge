@@ -37,14 +37,15 @@ CODEX -> CLAUDE
   bridge.py to-claude --to <name|local_id> "message" [--thread T]
   bridge.py relay [--minutes 55]             run by a Claude session under Monitor; prints each
                                              inbox message as one line to deliver with SendMessage
-  bridge.py claude-start "prompt" [--cwd D]  start a background Claude Code session (claude --bg);
-                                             continue it: claude --bg --resume <id> "msg"; stop: claude stop <id>
+  bridge.py claude-start "prompt" [--cwd D] [--name N] [--no-remote-control]
+                                             start a visible background Claude Code session and record its URL
+  bridge.py claude-started [--last N]          list recorded sessions with their current status
   bridge.py claude-read <local_id|name|sessionId> [--last N]   recent messages from its transcript
 
 DAEMON
   bridge.py up | down | ping
 """
-import argparse, fcntl, glob, json, os, queue, socket, socketserver, subprocess, sys, threading, time, uuid
+import argparse, fcntl, glob, json, os, queue, re, socket, socketserver, subprocess, sys, threading, time, uuid
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -1120,10 +1121,221 @@ def cmd_claude_read(a):
     return 0
 
 
+ANSI_ESCAPE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+BACKGROUND_ID = re.compile(r"backgrounded\s*[·•]\s*([0-9a-fA-F]+)\s*[·•]", re.IGNORECASE)
+REMOTE_URL = re.compile(r"https://claude\.ai/code/session_[A-Za-z0-9_-]+")
+REMOTE_CONTROL_TIMEOUT = 20
+REMOTE_CONTROL_POLL = 0.5
+
+
+def strip_ansi(value):
+    """Elimina secuencias ANSI antes de analizar la salida de la CLI."""
+    return ANSI_ESCAPE.sub("", value or "")
+
+
+def parse_backgrounded_id(output):
+    """Devuelve el identificador corto que imprime ``claude --bg``."""
+    match = BACKGROUND_ID.search(strip_ansi(output))
+    return match.group(1) if match else None
+
+
+def claude_agents_all():
+    """Consulta todas las sesiones sin leer estado privado de Claude a mano."""
+    try:
+        result = subprocess.run(["claude", "agents", "--json", "--all"],
+                                capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"claude agents no respondió: {exc}") from exc
+    if result.returncode:
+        detail = (result.stderr or result.stdout or "sin salida").strip()
+        raise RuntimeError(f"claude agents falló ({result.returncode}): {detail}")
+    try:
+        data = json.loads(result.stdout or "[]")
+    except ValueError as exc:
+        raise RuntimeError(f"claude agents devolvió JSON inválido: {exc}") from exc
+    if isinstance(data, dict):
+        data = data.get("sessions") or data.get("data") or []
+    if not isinstance(data, list):
+        raise RuntimeError("claude agents no devolvió una lista de sesiones")
+    return data
+
+
+def session_for_short_id(rows, short_id):
+    """Encuentra la fila de ``claude agents`` correspondiente al id corto."""
+    return next((row for row in rows if str(row.get("id", "")) == short_id), None)
+
+
+def remote_control_url(short_id, timeout=REMOTE_CONTROL_TIMEOUT):
+    """Sondea los logs durante un tiempo limitado hasta que Remote Control esté activo."""
+    deadline = time.monotonic() + max(0, timeout)
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining < 0:
+            return None
+        try:
+            result = subprocess.run(["claude", "logs", short_id], capture_output=True, text=True,
+                                    timeout=max(0.1, min(5, remaining)))
+            match = REMOTE_URL.search(strip_ansi((result.stdout or "") + "\n" + (result.stderr or "")))
+            if match:
+                return match.group(0)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        time.sleep(min(REMOTE_CONTROL_POLL, remaining))
+
+
+def started_log_path():
+    return HOME / "claude-started.jsonl"
+
+
+def append_started(record):
+    """Añade un registro completo en una sola escritura, con permisos de usuario."""
+    HOME.mkdir(parents=True, exist_ok=True)
+    data = (json.dumps(record, ensure_ascii=False) + "\n").encode()
+    fd = os.open(started_log_path(), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    try:
+        written = os.write(fd, data)
+        if written != len(data):
+            raise OSError(f"escritura parcial de claude-started.jsonl: {written}/{len(data)} bytes")
+    finally:
+        os.close(fd)
+
+
+def read_started():
+    records = []
+    try:
+        lines = started_log_path().read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return records
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(record, dict):
+            records.append(record)
+    return records
+
+
+def claude_state(row):
+    """Normaliza los estados que imprime ``claude agents`` al contrato del bridge."""
+    values = {str(row.get(key, "")).lower() for key in ("status", "state")}
+    if values & {"running", "active", "connecting", "working", "in_progress"}:
+        return "running"
+    if values & {"completed", "complete", "done", "exited", "stopped", "failed", "error"}:
+        return "completed"
+    return "unknown"
+
+
+def session_row(record, rows):
+    row = session_for_short_id(rows, str(record.get("short_id", "")))
+    if row is None and record.get("session_id"):
+        row = next((item for item in rows if item.get("sessionId") == record["session_id"]), None)
+    return row
+
+
+def session_state(record, rows):
+    row = session_row(record, rows)
+    return claude_state(row) if row else "unknown"
+
+
+def resume_command(session_id):
+    return f"claude --resume {session_id}" if session_id else "pending"
+
+
+def default_claude_name(thread):
+    return f"codex {datetime.now().strftime('%H:%M')} {(thread or 'none')[:4]}"
+
+
+def notify_started(name, remote_url):
+    """Envía una notificación opcional sin convertirla en requisito de arranque."""
+    url = remote_url or "-"
+    text = f"{name} · {url}"
+
+    def apple_string(value):
+        return '"' + value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ") + '"'
+
+    script = f"display notification {apple_string(text)} with title {apple_string('Codex → Claude')}"
+    result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=10)
+    if result.returncode:
+        detail = (result.stderr or result.stdout or "sin detalle").strip()
+        print(f"WARNING: no se pudo mostrar la notificación: {detail}", file=sys.stderr)
+
+
 def cmd_claude_start(a):
-    r = subprocess.run(["claude", "--bg", a.prompt], cwd=a.cwd, capture_output=True, text=True, timeout=60)
-    print((r.stdout + r.stderr).strip())
-    return r.returncode
+    name = a.name or default_claude_name(a.thread)
+    command = ["claude", "--bg", f"--name={name}"]
+    if a.remote_control:
+        command += [f"--remote-control={name}"]
+    command += ["--", a.prompt]
+    result = subprocess.run(command, cwd=a.cwd, capture_output=True, text=True, timeout=60)
+    output = ((result.stdout or "") + (result.stderr or "")).strip()
+    if output:
+        print(output)
+    if result.returncode:
+        print(f"ERROR: claude --bg terminó con código {result.returncode}", file=sys.stderr)
+        return result.returncode
+    short_id = parse_backgrounded_id(output)
+    if not short_id:
+        print("ERROR: claude --bg no devolvió un id corto en una línea 'backgrounded · <id> · <name>'. "
+              f"Salida: {output or '(vacía)'}", file=sys.stderr)
+        return 5
+
+    try:
+        rows = claude_agents_all()
+    except Exception as exc:
+        rows = []
+        print(f"WARNING: no se pudo resolver sessionId con claude agents: {exc}", file=sys.stderr)
+    row = session_for_short_id(rows, short_id)
+    session_id = row.get("sessionId") if row else None
+    if not session_id:
+        print(f"WARNING: claude agents no contiene todavía el id {short_id}; resume queda pendiente.", file=sys.stderr)
+
+    url = remote_control_url(short_id) if a.remote_control else None
+    if a.remote_control and not url:
+        print(f"WARNING: Remote Control no publicó URL para {short_id} dentro de {REMOTE_CONTROL_TIMEOUT} s.",
+              file=sys.stderr)
+    record = {
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "short_id": short_id,
+        "session_id": session_id,
+        "name": name,
+        "cwd": str(Path(a.cwd).resolve()),
+        "from_thread": a.thread,
+        "remote_url": url,
+    }
+    append_started(record)
+    if a.notify:
+        try:
+            notify_started(name, url)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            print(f"WARNING: no se pudo mostrar la notificación: {exc}", file=sys.stderr)
+    print(f"CLAUDE-STARTED {short_id} name={name} url={url or '-'} "
+          f"resume=\"{resume_command(session_id)}\" from=codex://threads/{a.thread or '-'}")
+    return 0
+
+
+def cmd_claude_started(a):
+    records = read_started()
+    if a.last is not None:
+        records = records[-a.last:] if a.last > 0 else []
+    try:
+        rows = claude_agents_all()
+    except (OSError, RuntimeError) as exc:
+        rows = []
+        print(f"WARNING: no se pudo consultar el estado actual: {exc}", file=sys.stderr)
+    for record in records:
+        short_id = record.get("short_id", "-")
+        url = record.get("remote_url") or "-"
+        row = session_row(record, rows)
+        session_id = record.get("session_id") or (row or {}).get("sessionId")
+        print(f"{session_state(record, rows):<9} {record.get('name', '-')} "
+              f"id={short_id} session_id={session_id or '-'} "
+              f"url={url} resume=\"{resume_command(session_id)}\" "
+              f"cwd={record.get('cwd', '-')}")
+    return 0
 
 
 def cmd_doctor(a):
@@ -1212,6 +1424,12 @@ def main():
     p = sub.add_parser("to-claude"); p.add_argument("--to", required=True); p.add_argument("message"); p.add_argument("--thread")
     p = sub.add_parser("relay"); p.add_argument("--minutes", type=int, default=55); p.add_argument("--name", default="default")
     p = sub.add_parser("claude-start"); p.add_argument("prompt"); p.add_argument("--cwd", default=str(Path.home()))
+    p.add_argument("--name", default=None)
+    p.add_argument("--remote-control", dest="remote_control", action="store_true", default=True)
+    p.add_argument("--no-remote-control", dest="remote_control", action="store_false")
+    p.add_argument("--thread", default=os.environ.get("CODEX_THREAD_ID"))
+    p.add_argument("--notify", action="store_true")
+    p = sub.add_parser("claude-started"); p.add_argument("--last", type=int, default=None)
     p = sub.add_parser("claude-read"); p.add_argument("session"); p.add_argument("--last", type=int, default=4)
     for n in ("serve", "up", "ping"):
         sub.add_parser(n)
@@ -1241,7 +1459,8 @@ def main():
         print("down"); return 0
     if a.cmd == "app-connect":
         return cmd_app_connect(a)
-    local = {"claude-read": cmd_claude_read, "claude-list": cmd_claude_list, "to-claude": cmd_to_claude, "relay": cmd_relay, "claude-start": cmd_claude_start}
+    local = {"claude-read": cmd_claude_read, "claude-list": cmd_claude_list, "to-claude": cmd_to_claude,
+             "relay": cmd_relay, "claude-start": cmd_claude_start, "claude-started": cmd_claude_started}
     if a.cmd in local:
         return local[a.cmd](a)
     c = Client()
