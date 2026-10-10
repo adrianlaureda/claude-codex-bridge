@@ -201,67 +201,219 @@ def execution_policy(cwd, sandbox=None, full_access=False, no_network=False):
 
 # ---------------------------------------------------------------- app server
 
+def compact_error(value, limit=500):
+    """Reduce un error a una línea y evita volcar datos de la petición en los logs."""
+    text = str(value).strip().replace("\n", " ⏎ ")
+    return (text or type(value).__name__)[:limit]
+
+
+def redact_sensitive(value):
+    """Redacta tokens y valores con aspecto de secreto antes de registrar texto."""
+    text = str(value).replace("\n", " ⏎ ")
+    text = re.sub(r"Bearer\s+\S+", "Bearer [REDACTED]", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bsk-[A-Za-z0-9_-]+\b", "[REDACTED]", text)
+    text = re.sub(r"\b(key|token|password)\s*=\s*\S+", r"\1=[REDACTED]", text, flags=re.IGNORECASE)
+    return re.sub(r"\b[A-Za-z0-9+/=_-]{24,}\b", "[REDACTED]", text)
+
+
+class AppServerSendError(OSError):
+    """Fallo del envío, con indicación de si llegó algún byte al proceso."""
+
+    def __init__(self, method, cause, written=False):
+        self.method = method
+        self.cause = cause
+        self.written = written
+        super().__init__(f"{method}: app server send failed: {compact_error(cause)}")
+
+
 class AppServer:
     """One JSON-RPC connection to `codex app-server` over stdio."""
 
     def __init__(self, on_request=None, on_note=None):
         if not os.access(CODEX, os.X_OK):
             sys.exit(f"Codex binary not found at {CODEX}. Set CODEX_BIN.")
-        self.p = subprocess.Popen([CODEX, "app-server"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                  stderr=subprocess.DEVNULL, text=True, bufsize=1)
         self.on_request, self.on_note = on_request, on_note
         self.n, self.waiting, self.wlock = 0, {}, threading.Lock()
-        # A reader thread, not select(): select() misses lines Python already buffered.
-        threading.Thread(target=self._pump, daemon=True).start()
-        self.call("initialize", {"clientInfo": {"name": "claude-codex-bridge", "version": "1"},
-                                 "capabilities": {"experimentalApi": True}})
-        self._send({"jsonrpc": "2.0", "method": "initialized"})
-
-    def _send(self, o):
-        with self.wlock:
-            self.p.stdin.write(json.dumps(o) + "\n")
-            self.p.stdin.flush()
-
-    def _pump(self):
-        for line in self.p.stdout:
+        self.p, self._stderr_thread = None, None
+        self._pump_done = threading.Event()
+        self._stderr_state = {"lines": 0, "error": None}
+        for attempt in range(2):
+            proc = None
+            waiting = {}
+            pump_done = threading.Event()
+            stderr_state = {"lines": 0, "error": None}
             try:
-                o = json.loads(line)
-            except ValueError:
-                continue
-            if "id" in o and "method" not in o:
-                q = self.waiting.pop(o["id"], None)
-                if q:
-                    q.put(o)
-            elif "id" in o:
-                threading.Thread(target=self._request, args=(o,), daemon=True).start()
-            elif self.on_note:
-                self.on_note(o)
-        for q in list(self.waiting.values()):
-            q.put({"error": {"message": "Codex app server exited"}})
+                proc = subprocess.Popen([CODEX, "app-server"], stdin=subprocess.PIPE,
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                        cwd=Path.home(), text=True, bufsize=1)
+                self.p = proc
+                self.waiting = waiting
+                self._pump_done = pump_done
+                self._stderr_state = stderr_state
+                self._stderr_thread = threading.Thread(target=self._read_stderr,
+                                                        args=(proc.stderr, stderr_state), daemon=True)
+                self._stderr_thread.start()
+                # A reader thread, not select(): select() misses lines Python already buffered.
+                threading.Thread(target=self._pump, args=(proc, waiting, pump_done), daemon=True).start()
+                result = self.call("initialize", {
+                    "clientInfo": {"name": "claude-codex-bridge", "version": "1"},
+                    "capabilities": {"experimentalApi": True},
+                }, proc=proc, waiting=waiting)
+                if "error" in result:
+                    raise RuntimeError((result.get("error") or {}).get("message", "initialize failed"))
+                self._send({"jsonrpc": "2.0", "method": "initialized"}, proc=proc)
+                return
+            except Exception as exc:
+                self._log_start_error(exc, proc, stderr_state, self._stderr_thread, attempt + 1)
+                self._wake_waiting(waiting)
+                self._terminate(proc)
+                if attempt:
+                    raise
 
-    def _request(self, o):
+    def _read_stderr(self, stream, state):
+        try:
+            for line in stream:
+                line = line.strip()
+                state["lines"] += 1
+                if state["error"] is None and line.startswith("Error:"):
+                    state["error"] = redact_sensitive(line)
+        except (OSError, ValueError):
+            pass
+
+    def _stderr_summary(self, state, thread, proc):
+        if thread and proc and proc.poll() is not None:
+            thread.join(timeout=0.5)
+        error_line = state.get("error")
+        return "Error:" if error_line else None
+
+    def _log_start_error(self, exc, proc, stderr_state, stderr_thread, attempt):
+        record = {"event": "app_server_start_error", "pid": proc.pid if proc else None,
+                  "method": "initialize", "attempt": attempt,
+                  "returncode": proc.poll() if proc else None,
+                  "stderr_lines": stderr_state["lines"]}
+        stderr_error = self._stderr_summary(stderr_state, stderr_thread, proc)
+        if stderr_error:
+            record["stderr_error"] = stderr_error
+        append(LOG, record)
+        detail = f" stderr_error={stderr_error}" if stderr_error else ""
+        emit(f"app-server start error pid={record['pid']} method=initialize "
+             f"returncode={record['returncode']} stderr_lines={record['stderr_lines']}{detail}")
+
+    def _send(self, o, proc=None):
+        proc = proc or self.p
+        with self.wlock:
+            payload = (json.dumps(o) + "\n").encode()
+            sent = 0
+            try:
+                while sent < len(payload):
+                    count = os.write(proc.stdin.fileno(), payload[sent:])
+                    if not count:
+                        raise BrokenPipeError("app server stdin accepted no bytes")
+                    sent += count
+            except (BrokenPipeError, OSError) as exc:
+                raise AppServerSendError(o.get("method", "response"), exc, written=sent > 0) from exc
+
+    def _pump(self, proc, waiting, pump_done):
+        try:
+            for line in proc.stdout:
+                if proc is not self.p:
+                    continue
+                try:
+                    o = json.loads(line)
+                except ValueError:
+                    continue
+                if "id" in o and "method" not in o:
+                    q = waiting.pop(o["id"], None)
+                    if q:
+                        q.put(o)
+                elif "id" in o:
+                    threading.Thread(target=self._request, args=(proc, o), daemon=True).start()
+                elif self.on_note:
+                    self.on_note(o)
+        except (ValueError, OSError):
+            pass
+        finally:
+            self._wake_waiting(waiting)
+            pump_done.set()
+
+    def _request(self, proc, o):
         result = self.on_request(o) if self.on_request else None
-        if result is None:
-            self._send({"jsonrpc": "2.0", "id": o["id"],
-                        "error": {"code": -32601, "message": f"{o['method']} is not handled by the bridge"}})
-        else:
-            self._send({"jsonrpc": "2.0", "id": o["id"], "result": result})
+        try:
+            if result is None:
+                self._send({"jsonrpc": "2.0", "id": o["id"],
+                            "error": {"code": -32601, "message": f"{o['method']} is not handled by the bridge"}},
+                           proc=proc)
+            else:
+                self._send({"jsonrpc": "2.0", "id": o["id"], "result": result}, proc=proc)
+        except (AppServerSendError, BrokenPipeError, OSError):
+            pass
 
-    def call(self, method, params, timeout=60):
+    @staticmethod
+    def _wake_waiting(waiting):
+        for q in list(waiting.values()):
+            q.put({"error": {"message": "Codex app server exited"}})
+        waiting.clear()
+
+    @staticmethod
+    def _terminate(proc):
+        if not proc:
+            return
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+            proc.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+                proc.wait(timeout=0.5)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        except OSError:
+            pass
+        finally:
+            AppServer._close_streams(proc)
+
+    @staticmethod
+    def _close_streams(proc):
+        for stream in (proc.stdin, proc.stdout, proc.stderr):
+            try:
+                if stream:
+                    stream.close()
+            except (OSError, ValueError):
+                pass
+
+    def call(self, method, params, timeout=60, proc=None, waiting=None):
+        proc = proc or self.p
+        waiting = waiting if waiting is not None else self.waiting
         with self.wlock:
             self.n += 1
             i = self.n
         q = queue.Queue()
-        self.waiting[i] = q
-        self._send({"jsonrpc": "2.0", "id": i, "method": method, "params": params})
+        waiting[i] = q
+        if proc.poll() is not None:
+            waiting.pop(i, None)
+            raise AppServerSendError(method, "process already terminated")
+        try:
+            self._send({"jsonrpc": "2.0", "id": i, "method": method, "params": params}, proc=proc)
+        except AppServerSendError:
+            waiting.pop(i, None)
+            raise
+        except (BrokenPipeError, OSError) as exc:
+            waiting.pop(i, None)
+            raise AppServerSendError(method, exc) from exc
+
         try:
             return q.get(timeout=timeout)
         except queue.Empty:
-            self.waiting.pop(i, None)
+            waiting.pop(i, None)
             return {"error": {"message": f"{method}: no response in {timeout}s"}}
 
     def close(self):
-        self.p.terminate()
+        proc = self.p
+        if not proc:
+            return
+        self._wake_waiting(self.waiting)
+        self._terminate(proc)
 
 
 # ---------------------------------------------------------------- daemon
@@ -313,10 +465,25 @@ class Daemon:
     def main(self):
         """Restart the read connection if its app server exited, instead of failing every read."""
         with self.mlock:
-            if self._main.p.poll() is not None:
+            if self._main is None or self._main.p.poll() is not None:
                 append(LOG, {"event": "main_restarted"})
                 self._main = AppServer(on_request=handle_tool_call)
             return self._main
+
+    def _main_call(self, method, params, timeout):
+        for attempt in range(2):
+            worker = self.main
+            try:
+                return worker.call(method, params, timeout)
+            except AppServerSendError as exc:
+                with self.mlock:
+                    if self._main is worker:
+                        self._main = None
+                worker.close()
+                if exc.written:
+                    raise
+                if attempt:
+                    raise
 
     def note(self, o):
         m, p = o.get("method"), o.get("params") or {}
@@ -336,10 +503,10 @@ class Daemon:
             with self.lock:
                 for tid in list(self.workers):
                     w = self.workers[tid]
-                    if w.p.poll() is not None:  # worker died: forget it, or the thread looks busy forever
+                    if w.p.poll() is not None and w._pump_done.is_set():  # EOF confirms the pump drained stdout
                         self.workers.pop(tid)
                         self.running.pop(tid, None)
-                    elif (tid not in self.running and not self.inflight[tid]
+                    elif (w.p.poll() is None and tid not in self.running and not self.inflight[tid]
                           and time.time() - self.touched.get(tid, 0) > IDLE_CLOSE):
                         self.workers.pop(tid).close()
 
@@ -351,7 +518,11 @@ class Daemon:
                     return w, None
             w = AppServer(on_request=handle_tool_call, on_note=self.note)
             if method != "thread/resume":
-                r = w.call("thread/resume", {"threadId": tid})
+                try:
+                    r = w.call("thread/resume", {"threadId": tid})
+                except AppServerSendError:
+                    w.close()
+                    raise
                 if "error" in r:
                     w.close()
                     return None, r
@@ -369,35 +540,79 @@ class Daemon:
         if method not in WRITES:
             # A thread a worker has loaded is only visible to that worker until its rollout exists.
             w = self.workers.get(params.get("threadId")) if isinstance(params, dict) else None
-            return (w or self.main).call(method, params, timeout)
+            if w:
+                tid = params.get("threadId")
+                self.inflight[tid] += 1
+                try:
+                    for attempt in range(2):
+                        try:
+                            return w.call(method, params, timeout)
+                        except AppServerSendError as exc:
+                            with self.lock:
+                                if self.workers.get(tid) is w:
+                                    self.workers.pop(tid)
+                            w.close()
+                            if exc.written:
+                                raise
+                            if attempt:
+                                raise
+                            w, err = self._worker(tid, method)
+                            if err:
+                                return err
+                finally:
+                    self.inflight[tid] -= 1
+                    self.touched[tid] = time.time()
+            return self._main_call(method, params, timeout)
         if method in ("thread/start", "thread/fork"):
-            w = AppServer(on_request=handle_tool_call, on_note=self.note)
-            r = w.call(method, params, timeout)
-            tid = ((r.get("result") or {}).get("thread") or {}).get("id")
-            if not tid:
-                w.close()
+            for attempt in range(2):
+                w = AppServer(on_request=handle_tool_call, on_note=self.note)
+                try:
+                    r = w.call(method, params, timeout)
+                except AppServerSendError as exc:
+                    w.close()
+                    if exc.written:
+                        raise
+                    if attempt:
+                        raise
+                    continue
+                tid = ((r.get("result") or {}).get("thread") or {}).get("id")
+                if not tid:
+                    w.close()
+                    return r
+                with self.lock:
+                    self.workers[tid] = w
+                    self.touched[tid] = time.time()
                 return r
-            with self.lock:
-                self.workers[tid] = w
-                self.touched[tid] = time.time()
-            return r
         tid = params.get("threadId")
         self.inflight[tid] += 1  # the reaper never closes a worker mid-call
         try:
-            w, err = self._worker(tid, method)
-            if err:
-                return err
-            r = w.call(method, params, timeout)
-            if method == "thread/resume" and "error" in r:
-                with self.lock:
-                    if self.workers.get(tid) is w:
-                        self.workers.pop(tid)
-                w.close()
-            if method == "turn/start" and "result" in r:
-                t = r["result"]["turn"]["id"]
-                if t not in self.done:  # a turn that ended before this reply must not stay "running"
-                    self.running[tid] = t
-            return r
+            for attempt in range(2):
+                w = None
+                try:
+                    w, err = self._worker(tid, method)
+                    if err:
+                        return err
+                    r = w.call(method, params, timeout)
+                    if method == "thread/resume" and "error" in r:
+                        with self.lock:
+                            if self.workers.get(tid) is w:
+                                self.workers.pop(tid)
+                        w.close()
+                    if method == "turn/start" and "result" in r:
+                        t = r["result"]["turn"]["id"]
+                        if t not in self.done:  # a turn that ended before this reply must not stay "running"
+                            self.running[tid] = t
+                    return r
+                except AppServerSendError as exc:
+                    if w:
+                        with self.lock:
+                            if self.workers.get(tid) is w:
+                                self.workers.pop(tid)
+                        w.close()
+                    if exc.written:
+                        raise
+                    if attempt:
+                        raise
         finally:
             self.inflight[tid] -= 1
             self.touched[tid] = time.time()
@@ -417,11 +632,17 @@ def serve():
 
     class H(socketserver.StreamRequestHandler):
         def handle(self):
+            req = None
             for line in self.rfile:
                 try:
                     req = json.loads(line)
                     res = d.rpc(req["method"], req.get("params") or {})
                 except Exception as e:  # keep the daemon up on any bad request
+                    method = req.get("method") if isinstance(req, dict) else None
+                    record = {"event": "rpc_error", "pid": os.getpid(), "method": method,
+                              "error": compact_error(e)}
+                    append(LOG, record)
+                    emit(f"rpc error pid={record['pid']} method={method} error={record['error']}")
                     res = {"error": {"message": f"bridge: {e}"}}
                 self.wfile.write((json.dumps(res) + "\n").encode())
                 self.wfile.flush()
@@ -458,8 +679,10 @@ def up():
         fcntl.flock(lk, fcntl.LOCK_EX)
         if ping():
             return
-        subprocess.Popen([sys.executable, os.path.abspath(__file__), "serve"], start_new_session=True,
-                         stdin=subprocess.DEVNULL, stdout=open(HOME / "daemon.log", "a"), stderr=subprocess.STDOUT)
+        with open(HOME / "daemon.log", "a") as daemon_log:
+            subprocess.Popen([sys.executable, os.path.abspath(__file__), "serve"], cwd=Path.home(),
+                             start_new_session=True, stdin=subprocess.DEVNULL,
+                             stdout=daemon_log, stderr=subprocess.STDOUT)
         for _ in range(100):
             if ping():
                 return
