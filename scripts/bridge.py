@@ -21,6 +21,9 @@ CLAUDE -> CODEX
   bridge.py watch <thread> [--timeout S] [--from-start]   stream until the current turn ends
   bridge.py steer <thread> "text"            add input to the running turn (bridge-held threads)
   bridge.py stop <thread>                    interrupt the running turn (bridge-held threads)
+  bridge.py tidy [--hours 24] [--dry-run] [--quiet]
+                                             archive old registered, idle bridge threads
+  bridge.py keep <thread> | unkeep <thread> protect or unprotect a registered thread from tidy
   bridge.py list [--limit N] [--search TEXT] [--archived]
   bridge.py read <thread> [--turns N]
   bridge.py status <thread>                  held by / running / queue
@@ -47,7 +50,7 @@ DAEMON
 """
 import argparse, fcntl, glob, json, os, queue, re, socket, socketserver, subprocess, sys, threading, time, uuid
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 CODEX = os.environ.get("CODEX_BIN",
@@ -129,13 +132,28 @@ def load_threads():
         return {}
 
 
-def save_thread(tid, **kw):
-    d = load_threads()
-    d.setdefault(tid, {}).update(kw)
+def _thread_lock():
     HOME.mkdir(parents=True, exist_ok=True)
+    fd = os.open(HOME / "threads.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    return fd
+
+
+def _write_threads(data):
     tmp = THREADS.with_suffix(f".{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(d, indent=1))
+    tmp.write_text(json.dumps(data, indent=1))
     tmp.replace(THREADS)
+
+
+def save_thread(tid, **kw):
+    lock = _thread_lock()
+    try:
+        d = load_threads()
+        d.setdefault(tid, {}).update(kw)
+        _write_threads(d)
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        os.close(lock)
 
 
 def normalize_cwd(value):
@@ -921,6 +939,51 @@ def set_title(c, tid, title):
     return False
 
 
+def launch_autotidy():
+    """Lanza la limpieza en segundo plano y no hace esperar al start."""
+    if os.environ.get("CLAUDE_CODEX_BRIDGE_AUTOTIDY", "1").strip() == "0":
+        return
+    try:
+        subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "tidy", "--hours", "24", "--quiet"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        emit(f"WARN: no se pudo lanzar autotidy: {compact_error(exc)}")
+
+
+def _release_thread_lock(lock):
+    fcntl.flock(lock, fcntl.LOCK_UN)
+    os.close(lock)
+
+
+def _ensure_unarchived_locked(c, tid, force=False):
+    """Reabre un hilo archivado antes de continuar un encargo sobre él."""
+    r = c.call("thread/read", {"threadId": tid}, timeout=10)
+    if "error" in r:
+        ok(r, "thread/read")
+    thread = (r.get("result") or {}).get("thread")
+    if force or (isinstance(thread, dict) and thread.get("archived") is True):
+        ok(call_held(c, "thread/unarchive", {"threadId": tid}), "thread/unarchive")
+        emit(f"UNARCHIVED {tid}")
+
+
+def ensure_unarchived(c, tid):
+    """Toma threads.lock y lo devuelve al llamador para cubrir el RPC siguiente."""
+    lock = _thread_lock()
+    try:
+        _ensure_unarchived_locked(c, tid)
+        return lock
+    except (Exception, SystemExit):
+        _release_thread_lock(lock)
+        raise
+
+
+def _archived_error(response):
+    return "archiv" in str((response.get("error") or {}).get("message", "")).lower()
+
+
 def cmd_start(c, a):
     try:
         cwd = normalize_cwd(a.cwd)
@@ -949,49 +1012,70 @@ def cmd_start(c, a):
               "turn/start")["turn"]["id"]
     if a.title:
         set_title(c, tid, a.title)
-    if a.section:
-        move(c, tid, a.section)
+    move_target = a.section or os.environ.get("CLAUDE_CODEX_BRIDGE_SECTION", "").strip() or "🤖 Agentes-encargos"
+    move_best_effort(c, tid, move_target)
+    launch_autotidy()
     if a.no_watch:
         return 0
     return watch(tid, a.timeout, offset=0, turn_id=turn)
 
 
 def cmd_send(c, a):
-    path = rollout_path(a.thread, wait=0)
-    off = file_size(path)
-    if held_by_app(c, a.thread):
-        if app_port_up():
-            if app_active_turn(a.thread):
-                emit("FAILED: a turn is running in the ChatGPT app. Use steer to add to it, or wait.")
-                return 5
-            r = app_call("turn/start", turn_params(a.thread, a.prompt, a))
-            if r and "result" in r:
-                turn = r["result"]["turn"]["id"]
-                emit(f"SENT {now()} to {a.thread} turn {turn} (through the ChatGPT app)")
-                append(LOG, {"event": "sent_app", "thread": a.thread, "turn": turn})
-                return 0 if a.no_watch else watch(a.thread, a.timeout, path=path, offset=off, turn_id=turn)
-            emit(f"WARN: app route failed ({(r or {}).get('error', {}).get('message')}); queueing instead")
-        r = ok(c.call("thread/queue/add", {"threadId": a.thread, "clientUserMessageId": str(uuid.uuid4()),
-                                           "input": [{"type": "text", "text": a.prompt}]}), "thread/queue/add")
-        emit(f"QUEUED {now()} {r['queuedSubmission'].get('id')}: the ChatGPT app holds this thread; "
-             "it checks its queue about every 10 s and then starts the turn")
-        append(LOG, {"event": "queued", "thread": a.thread})
-        return 0 if a.no_watch else watch(a.thread, a.timeout, path=path, offset=off, match_text=a.prompt)
-    running = c.call("bridge/running", {"threadId": a.thread}).get("result", {}).get("turnId")
-    if running:
-        emit(f"FAILED: a turn is running ({running}). Use steer to add to it, or wait.")
-        return 5
-    turn = ok(c.call("turn/start", turn_params(a.thread, a.prompt, a)), "turn/start")["turn"]["id"]
-    emit(f"SENT {now()} to {a.thread} turn {turn}")
-    append(LOG, {"event": "sent", "thread": a.thread, "turn": turn})
-    if a.no_watch:
-        return 0
-    return watch(a.thread, a.timeout, path=path, offset=off, turn_id=turn)
+    lock = ensure_unarchived(c, a.thread)
+    try:
+        path = rollout_path(a.thread, wait=0)
+        off = file_size(path)
+        if held_by_app(c, a.thread):
+            if app_port_up():
+                if app_active_turn(a.thread):
+                    emit("FAILED: a turn is running in the ChatGPT app. Use steer to add to it, or wait.")
+                    return 5
+                r = app_call("turn/start", turn_params(a.thread, a.prompt, a))
+                if r and "error" in r and _archived_error(r):
+                    _ensure_unarchived_locked(c, a.thread, force=True)
+                    r = app_call("turn/start", turn_params(a.thread, a.prompt, a))
+                if r and "result" in r:
+                    turn = r["result"]["turn"]["id"]
+                    emit(f"SENT {now()} to {a.thread} turn {turn} (through the ChatGPT app)")
+                    append(LOG, {"event": "sent_app", "thread": a.thread, "turn": turn})
+                    _release_thread_lock(lock)
+                    lock = None
+                    return 0 if a.no_watch else watch(a.thread, a.timeout, path=path, offset=off, turn_id=turn)
+                emit(f"WARN: app route failed ({(r or {}).get('error', {}).get('message')}); queueing instead")
+            r = ok(c.call("thread/queue/add", {"threadId": a.thread, "clientUserMessageId": str(uuid.uuid4()),
+                                               "input": [{"type": "text", "text": a.prompt}]}), "thread/queue/add")
+            emit(f"QUEUED {now()} {r['queuedSubmission'].get('id')}: the ChatGPT app holds this thread; "
+                 "it checks its queue about every 10 s and then starts the turn")
+            append(LOG, {"event": "queued", "thread": a.thread})
+            _release_thread_lock(lock)
+            lock = None
+            return 0 if a.no_watch else watch(a.thread, a.timeout, path=path, offset=off, match_text=a.prompt)
+        running = c.call("bridge/running", {"threadId": a.thread}).get("result", {}).get("turnId")
+        if running:
+            emit(f"FAILED: a turn is running ({running}). Use steer to add to it, or wait.")
+            return 5
+        turn_response = c.call("turn/start", turn_params(a.thread, a.prompt, a))
+        if _archived_error(turn_response):
+            _ensure_unarchived_locked(c, a.thread, force=True)
+            turn_response = c.call("turn/start", turn_params(a.thread, a.prompt, a))
+        turn = ok(turn_response, "turn/start")["turn"]["id"]
+        emit(f"SENT {now()} to {a.thread} turn {turn}")
+        append(LOG, {"event": "sent", "thread": a.thread, "turn": turn})
+        _release_thread_lock(lock)
+        lock = None
+        if a.no_watch:
+            return 0
+        return watch(a.thread, a.timeout, path=path, offset=off, turn_id=turn)
+    finally:
+        if lock is not None:
+            _release_thread_lock(lock)
 
 
 def cmd_watch(c, a):
     """Follow the turn that is running, or the next one if a message is waiting; otherwise
     print the last answer. --from-start replays the latest turn."""
+    lock = ensure_unarchived(c, a.thread)
+    _release_thread_lock(lock)
     path = rollout_path(a.thread, wait=0)
     if not path:
         emit(f"FAILED: no rollout file for {a.thread}")
@@ -1054,17 +1138,21 @@ def app_turn_op(c, a, method, verb):
 
 
 def cmd_steer(c, a):
-    r = app_turn_op(c, a, "turn/steer", "STEERED")
-    if r is not None:
-        return r
-    t = active_turn(c, a.thread)
-    if not t:
-        emit("FAILED: no running turn in this thread.")
-        return 5
-    ok(c.call("turn/steer", {"threadId": a.thread, "expectedTurnId": t, "input": [{"type": "text", "text": a.text}]}),
-       "turn/steer")
-    emit(f"STEERED {now()} turn {t}")
-    return 0
+    lock = ensure_unarchived(c, a.thread)
+    try:
+        r = app_turn_op(c, a, "turn/steer", "STEERED")
+        if r is not None:
+            return r
+        t = active_turn(c, a.thread)
+        if not t:
+            emit("FAILED: no running turn in this thread.")
+            return 5
+        ok(c.call("turn/steer", {"threadId": a.thread, "expectedTurnId": t, "input": [{"type": "text", "text": a.text}]}),
+           "turn/steer")
+        emit(f"STEERED {now()} turn {t}")
+        return 0
+    finally:
+        _release_thread_lock(lock)
 
 
 def cmd_stop(c, a):
@@ -1160,6 +1248,195 @@ def move(c, tid, sec):
     return 0
 
 
+def move_best_effort(c, tid, sec):
+    """Mueve un hilo de start sin convertir un fallo de organización en fallo del start."""
+    try:
+        r = c.call("threadSection/list", {})
+        if "error" in r:
+            raise RuntimeError(r["error"].get("message", "threadSection/list falló"))
+        ss = (r.get("result") or {}).get("data", [])
+        hit = next((s for s in ss if s.get("id") == sec or s.get("name", "").lower() == sec.lower()), None)
+        if not hit:
+            raise ValueError(f"no existe la sección {sec!r}")
+        r = c.call("thread/section/move", {"threadId": tid, "sectionId": hit["id"]})
+        if "error" in r:
+            raise RuntimeError(r["error"].get("message", "thread/section/move falló"))
+        emit(f"MOVED {tid} to {hit.get('name')}")
+    except (Exception, SystemExit) as exc:
+        emit(f"WARN: no se pudo mover {tid} a {sec!r}: {compact_error(exc)}")
+    return 0
+
+
+def _timestamp(value):
+    """Convierte timestamps del app server, en segundos, milisegundos o ISO, a epoch."""
+    if isinstance(value, (int, float)):
+        value = float(value)
+        return value / 1000 if value > 1_000_000_000_000 else value
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.timestamp()
+        except ValueError:
+            try:
+                return _timestamp(float(value))
+            except ValueError:
+                return None
+    return None
+
+
+def _thread_from_response(response):
+    result = response.get("result") or {}
+    thread = result.get("thread")
+    return thread if isinstance(thread, dict) else None
+
+
+def _thread_list(response):
+    result = response.get("result") or {}
+    rows = result.get("data") or []
+    return [row.get("thread", row) for row in rows if isinstance(row, dict)]
+
+
+def _tidy_warn(tid, message, silent):
+    if not silent:
+        emit(f"WARN: tidy {tid}: {message}")
+
+
+def _tidy_active(c, tid, thread):
+    """Comprueba tanto los turnos del hilo como los que el bridge tiene en ejecución."""
+    running = c.call("bridge/running", {"threadId": tid}, timeout=5)
+    if "error" in running:
+        raise RuntimeError(running["error"].get("message", "bridge/running falló"))
+    if (running.get("result") or {}).get("turnId"):
+        return True
+    for turn in (thread or {}).get("turns") or []:
+        if str(turn.get("status", "")).lower() in {"inprogress", "in_progress", "running", "started"}:
+            return True
+    return False
+
+
+def _tidy_lock():
+    HOME.mkdir(parents=True, exist_ok=True)
+    fd = os.open(HOME / "tidy.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def _tidy_one(c, tid, cutoff, dry_run, silent):
+    """Relee registro e hilo bajo locks justo antes de decidir el archive."""
+    lock = _thread_lock()
+    try:
+        records = load_threads()
+        record = records.get(tid) if isinstance(records, dict) else None
+        if not isinstance(record, dict) or record.get("archived_at") or record.get("keep") is True:
+            return "skipped"
+
+        # La lista sirve para descubrir candidatos; esta lectura es la comprobación TOCTOU.
+        response = c.call("thread/read", {"threadId": tid, "includeTurns": True}, timeout=10)
+        if "error" in response:
+            raise RuntimeError(response["error"].get("message", "thread/read falló"))
+        thread = _thread_from_response(response)
+        if not thread:
+            raise RuntimeError("thread/read no devolvió el hilo")
+        if thread.get("archived") is True or _tidy_active(c, tid, thread):
+            return "skipped"
+        activity = _timestamp(thread.get("recencyAt") or thread.get("updatedAt"))
+        if activity is None or activity > cutoff:
+            return "skipped"
+        if dry_run:
+            if not silent:
+                print(f"WOULD ARCHIVE {tid}")
+            return "skipped"
+
+        response = call_held(c, "thread/archive", {"threadId": tid})
+        if "error" in response:
+            raise RuntimeError(response["error"].get("message", "thread/archive falló"))
+        record["archived_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        _write_threads(records)
+        append(LOG, {"event": "tidy", "thread": tid})
+        if not silent:
+            print(f"ARCHIVED {tid}")
+        return "archived"
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        os.close(lock)
+
+
+def cmd_tidy(c, a, silent=False, lock=None):
+    """Archiva únicamente los hilos presentes en threads.json y que ya estén inactivos."""
+    silent = silent or getattr(a, "quiet", False)
+    own_lock = lock is None
+    lock = lock or _tidy_lock()
+    if lock is None:
+        return 0
+    try:
+        records = load_threads()
+        if not isinstance(records, dict):
+            records = {}
+        tids = [tid for tid, record in records.items()
+                if isinstance(record, dict) and not record.get("archived_at")]
+        cutoff = time.time() - max(0, a.hours) * 3600
+        archived = skipped = failed = 0
+        listed = {}
+        cursor = None
+        seen_cursors = set()
+        while tids:
+            try:
+                params = {"limit": min(100, max(1, len(tids))), "archived": False}
+                if cursor:
+                    params["cursor"] = cursor
+                response = c.call("thread/list", params, timeout=60)
+                if "error" in response:
+                    _tidy_warn("*", response["error"].get("message", "thread/list falló"), silent)
+                    break
+                page = _thread_list(response)
+                listed.update({thread.get("id"): thread for thread in page if thread.get("id")})
+                if len(listed) >= len(tids):
+                    break
+                result = response.get("result") or {}
+                next_cursor = result.get("nextCursor") or response.get("nextCursor")
+                if not next_cursor or next_cursor in seen_cursors:
+                    break
+                seen_cursors.add(next_cursor)
+                cursor = next_cursor
+            except Exception as exc:
+                _tidy_warn("*", compact_error(exc), silent)
+                break
+
+        for tid in tids:
+            try:
+                result = _tidy_one(c, tid, cutoff, a.dry_run, silent)
+                if result == "archived":
+                    archived += 1
+                else:
+                    skipped += 1
+            except Exception as exc:
+                failed += 1
+                _tidy_warn(tid, compact_error(exc), silent)
+        if not silent:
+            print(f"TIDY archived={archived} skipped={skipped} failed={failed}")
+        return 0
+    finally:
+        if own_lock:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            os.close(lock)
+
+
+def cmd_keep(a, keep):
+    records = load_threads()
+    if not isinstance(records, dict) or a.thread not in records:
+        emit(f"FAILED: {a.thread} no está en threads.json; no se modifica ningún hilo")
+        return 5
+    save_thread(a.thread, keep=keep)
+    emit(f"OK {'keep' if keep else 'unkeep'} {a.thread}")
+    return 0
+
+
 def cmd_simple(c, a):
     m = {"rename": ("thread/name/set", {"threadId": a.thread, "name": getattr(a, "name", None)}),
          "archive": ("thread/archive", {"threadId": a.thread}),
@@ -1167,6 +1444,11 @@ def cmd_simple(c, a):
          "fork": ("thread/fork", {"threadId": a.thread})}[a.cmd]
     r = ok(call_held(c, *m), m[0])
     new = ((r or {}).get("thread") or {}).get("id")
+    if a.cmd == "fork" and new and a.thread in load_threads():
+        parent = dict(load_threads()[a.thread])
+        parent.pop("archived_at", None)
+        parent["forked_from"] = a.thread
+        save_thread(new, **parent)
     emit(f"OK {a.cmd} {a.thread}" + (f" -> {new}" if new else ""))
     return 0
 
@@ -1626,6 +1908,9 @@ def main():
     p.add_argument("--from-start", action="store_true")
     p = sub.add_parser("steer"); p.add_argument("thread"); p.add_argument("text")
     p = sub.add_parser("stop"); p.add_argument("thread")
+    p = sub.add_parser("tidy"); p.add_argument("--hours", type=float, default=24); p.add_argument("--dry-run", action="store_true"); p.add_argument("--quiet", action="store_true")
+    p = sub.add_parser("keep"); p.add_argument("thread")
+    p = sub.add_parser("unkeep"); p.add_argument("thread")
     p = sub.add_parser("list"); p.add_argument("--limit", type=int, default=25); p.add_argument("--search")
     p.add_argument("--archived", action="store_true")
     p = sub.add_parser("read"); p.add_argument("thread"); p.add_argument("--turns", type=int, default=2)
@@ -1686,6 +1971,19 @@ def main():
              "relay": cmd_relay, "claude-start": cmd_claude_start, "claude-started": cmd_claude_started}
     if a.cmd in local:
         return local[a.cmd](a)
+    if a.cmd == "keep":
+        return cmd_keep(a, True)
+    if a.cmd == "unkeep":
+        return cmd_keep(a, False)
+    if a.cmd == "tidy":
+        lock = _tidy_lock()
+        if lock is None:
+            return 0
+        try:
+            return cmd_tidy(Client(), a, lock=lock)
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            os.close(lock)
     c = Client()
     if a.cmd == "sections":
         for s in sections(c):
@@ -1694,6 +1992,7 @@ def main():
     if a.cmd == "move":
         return move(c, a.thread, a.section)
     return {"start": cmd_start, "send": cmd_send, "watch": cmd_watch, "steer": cmd_steer, "stop": cmd_stop,
+            "tidy": cmd_tidy,
             "list": cmd_list, "read": cmd_read, "status": cmd_status, "rename": cmd_simple, "archive": cmd_simple,
             "unarchive": cmd_simple, "fork": cmd_simple, "settings": cmd_settings, "queue": cmd_queue,
             "goal": cmd_goal, "models": cmd_models, "mcp": cmd_mcp, "mcp-call": cmd_mcp_call, "rpc": cmd_rpc}[a.cmd](c, a)

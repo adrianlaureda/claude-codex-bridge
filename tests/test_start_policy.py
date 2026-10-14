@@ -2,6 +2,7 @@
 import argparse
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -18,8 +19,11 @@ SPEC.loader.exec_module(bridge)
 
 
 class FakeClient:
-    def __init__(self, thread_id="thread-1"):
+    def __init__(self, thread_id="thread-1", sections=None, fail_turn_archived_once=False):
         self.thread_id = thread_id
+        self.sections = sections or []
+        self.archived = False
+        self.fail_turn_archived_once = fail_turn_archived_once
         self.calls = []
 
     def call(self, method, params, timeout=60):
@@ -27,7 +31,20 @@ class FakeClient:
         if method == "thread/start":
             return {"result": {"thread": {"id": self.thread_id}}}
         if method == "turn/start":
+            if self.fail_turn_archived_once:
+                self.fail_turn_archived_once = False
+                self.archived = True
+                return {"error": {"message": "thread is archived"}}
             return {"result": {"turn": {"id": "turn-1"}}}
+        if method == "threadSection/list":
+            return {"result": {"data": self.sections}}
+        if method == "thread/section/move":
+            return {"result": {}}
+        if method == "thread/read":
+            return {"result": {"thread": {"id": self.thread_id, "archived": self.archived}}}
+        if method == "thread/unarchive":
+            self.archived = False
+            return {"result": {}}
         if method == "bridge/running":
             return {"result": {"turnId": None}}
         if method == "thread/queue/list":
@@ -60,8 +77,16 @@ class StartPolicyTests(unittest.TestCase):
         self.cwd.mkdir()
         self.home = Path(self.temp.name) / "bridge-home"
         self.home.mkdir()
+        self.paths = patch.multiple(
+            bridge, HOME=self.home, THREADS=self.home / "threads.json", LOG=self.home / "events.jsonl"
+        )
+        self.paths.start()
+        self.autotidy = patch.dict(os.environ, {"CLAUDE_CODEX_BRIDGE_AUTOTIDY": "0"})
+        self.autotidy.start()
 
     def tearDown(self):
+        self.autotidy.stop()
+        self.paths.stop()
         self.temp.cleanup()
 
     def router_result(self, **values):
@@ -89,7 +114,8 @@ class StartPolicyTests(unittest.TestCase):
             text=True,
             timeout=30,
         )
-        self.assertEqual([method for method, _, _ in client.calls], ["thread/start", "turn/start"])
+        self.assertEqual([method for method, _, _ in client.calls],
+                         ["thread/start", "turn/start", "threadSection/list"])
 
     def test_router_failure_invalid_json_and_provider_fail_before_rpc(self):
         cases = [
@@ -202,6 +228,95 @@ class StartPolicyTests(unittest.TestCase):
         self.assertEqual(saved["effort"], "low")
         self.assertEqual(saved["sandbox"], "read-only")
         self.assertEqual(saved["cwd"], str(self.cwd.resolve()))
+
+    def test_start_moves_to_environment_default_section(self):
+        client = FakeClient(sections=[{"id": "agentes-id", "name": "🤖 Agentes-encargos"}])
+        args = start_args(self.cwd)
+        with patch.dict(os.environ, {"CLAUDE_CODEX_BRIDGE_SECTION": "🤖 Agentes-encargos"}), \
+             patch.object(bridge, "route_model", return_value={"model": "gpt-test", "effort": "low"}), \
+             patch.object(bridge, "save_thread"), patch.object(bridge, "append"), \
+             patch.object(bridge, "set_title"), patch.object(bridge, "watch"), \
+             patch.object(bridge, "cmd_tidy"):
+            self.assertEqual(bridge.cmd_start(client, args), 0)
+
+        self.assertEqual(client.calls[-1][0], "thread/section/move")
+        self.assertEqual(client.calls[-1][1], {"threadId": "thread-1", "sectionId": "agentes-id"})
+
+    def test_start_uses_builtin_default_section(self):
+        client = FakeClient(sections=[{"id": "agentes-id", "name": "🤖 Agentes-encargos"}])
+        args = start_args(self.cwd)
+        with patch.dict(os.environ, {"CLAUDE_CODEX_BRIDGE_SECTION": ""}), \
+             patch.object(bridge, "route_model", return_value={"model": "gpt-test", "effort": "low"}), \
+             patch.object(bridge, "save_thread"), patch.object(bridge, "append"), \
+             patch.object(bridge, "set_title"), patch.object(bridge, "watch"), \
+             patch.object(bridge, "cmd_tidy"):
+            self.assertEqual(bridge.cmd_start(client, args), 0)
+        self.assertEqual(client.calls[-1][1], {"threadId": "thread-1", "sectionId": "agentes-id"})
+
+    def test_start_missing_default_section_does_not_fail(self):
+        client = FakeClient()
+        args = start_args(self.cwd)
+        with patch.dict(os.environ, {"CLAUDE_CODEX_BRIDGE_SECTION": ""}), \
+             patch.object(bridge, "route_model", return_value={"model": "gpt-test", "effort": "low"}), \
+             patch.object(bridge, "save_thread"), patch.object(bridge, "append"), \
+             patch.object(bridge, "set_title"), patch.object(bridge, "watch"), \
+             patch.object(bridge, "cmd_tidy"):
+            self.assertEqual(bridge.cmd_start(client, args), 0)
+
+    def test_autotidy_zero_does_not_run_from_start(self):
+        client = FakeClient()
+        args = start_args(self.cwd)
+        with patch.object(bridge, "route_model", return_value={"model": "gpt-test", "effort": "low"}), \
+             patch.object(bridge, "save_thread"), patch.object(bridge, "append"), \
+             patch.object(bridge, "set_title"), patch.object(bridge, "watch"), \
+             patch.object(bridge, "cmd_tidy") as tidy:
+            self.assertEqual(bridge.cmd_start(client, args), 0)
+        tidy.assert_not_called()
+
+    def test_autotidy_is_detached_and_start_does_not_wait(self):
+        client = FakeClient()
+        args = start_args(self.cwd)
+        with patch.dict(os.environ, {"CLAUDE_CODEX_BRIDGE_AUTOTIDY": "1"}), \
+             patch.object(bridge, "route_model", return_value={"model": "gpt-test", "effort": "low"}), \
+             patch.object(bridge, "save_thread"), patch.object(bridge, "append"), \
+             patch.object(bridge, "set_title"), patch.object(bridge, "watch"), \
+             patch.object(bridge.subprocess, "Popen") as popen, \
+             patch.object(bridge, "cmd_tidy") as tidy:
+            self.assertEqual(bridge.cmd_start(client, args), 0)
+
+        popen.assert_called_once_with(
+            [sys.executable, str(Path(bridge.__file__).resolve()), "tidy", "--hours", "24", "--quiet"],
+            stdin=bridge.subprocess.DEVNULL, stdout=bridge.subprocess.DEVNULL,
+            stderr=bridge.subprocess.DEVNULL, start_new_session=True,
+        )
+        popen.return_value.wait.assert_not_called()
+        tidy.assert_not_called()
+
+    def test_send_unarchives_destination_before_turn(self):
+        client = FakeClient()
+        client.archived = True
+        args = argparse.Namespace(thread="thread-1", prompt="sigue", model=None, effort=None,
+                                  no_watch=True, timeout=1)
+        with patch.object(bridge, "rollout_path", return_value=None), \
+             patch.object(bridge, "held_by_app", return_value=False), \
+             patch.object(bridge, "append"):
+            self.assertEqual(bridge.cmd_send(client, args), 0)
+
+        methods = [method for method, _, _ in client.calls]
+        self.assertLess(methods.index("thread/unarchive"), methods.index("turn/start"))
+
+    def test_send_retries_turn_start_once_after_archived_error(self):
+        client = FakeClient(fail_turn_archived_once=True)
+        args = argparse.Namespace(thread="thread-1", prompt="sigue", model=None, effort=None,
+                                  no_watch=True, timeout=1)
+        with patch.object(bridge, "rollout_path", return_value=None), \
+             patch.object(bridge, "held_by_app", return_value=False), \
+             patch.object(bridge, "append"):
+            self.assertEqual(bridge.cmd_send(client, args), 0)
+
+        methods = [method for method, _, _ in client.calls]
+        self.assertEqual(methods.count("turn/start"), 2)
+        self.assertEqual(methods.count("thread/unarchive"), 1)
 
     def test_send_preserves_registered_policy(self):
         client = FakeClient()
