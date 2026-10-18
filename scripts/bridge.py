@@ -64,6 +64,7 @@ INBOX = HOME / "inbox.jsonl"
 THREADS = HOME / "threads.json"
 LOG = HOME / "events.jsonl"
 SESSIONS = Path.home() / ".codex" / "sessions"
+ARCHIVED_SESSIONS = Path.home() / ".codex" / "archived_sessions"
 LOCKED = "already has an active writer"
 
 TOOL = {
@@ -159,15 +160,32 @@ def save_thread(tid, **kw):
         os.close(lock)
 
 
-def mark_consumed(tid):
-    """Anota que alguien ya leyó el final del turno, para que `finished` no lo dé por pendiente.
+def mark_consumed(tid, turn_id=None, seen_at=None):
+    """Anota qué final de turno se leyó, para que `finished` no lo dé por pendiente.
 
+    Se guarda el turno observado (`consumed_turn`) y la hora de la observación (`seen_at`,
+    tomada antes de leer), no la de esta escritura: un turno que termine entre la lectura y
+    la marca sigue pendiente. La marca solo avanza (ids UUIDv7, ordenados por tiempo).
     Solo hilos registrados: un hilo ajeno al bridge no entra en threads.json por leerlo."""
+    seen_at = seen_at if seen_at is not None else time.time()
     try:
-        if tid in load_threads():
-            save_thread(tid, consumed_at=time.time())
+        lock = _thread_lock()
     except OSError:
-        pass  # no leer la marca solo hace que el vigilante avise de más, nunca de menos
+        return  # sin marca el vigilante avisa de más, nunca de menos
+    try:
+        d = load_threads()
+        meta = d.get(tid)
+        if meta is None:
+            return
+        if turn_id and str(turn_id) >= str(meta.get("consumed_turn") or ""):
+            meta["consumed_turn"] = str(turn_id)
+        meta["consumed_at"] = max(seen_at, meta.get("consumed_at") or 0)
+        _write_threads(d)
+    except OSError:
+        pass
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        os.close(lock)
 
 
 ROLLOUT_NAME = re.compile(r"rollout-.*?([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:_\d+)?\.jsonl$")
@@ -179,9 +197,11 @@ def recent_rollouts(hours, now_ts):
     `finished` lo llama un vigilante cada pocos minutos: recorrer todo ~/.codex/sessions sería caro."""
     found = {}
     days = int(hours // 24) + 2
-    for back in range(days):
-        day = datetime.fromtimestamp(now_ts - back * 86400)
-        folder = SESSIONS / f"{day:%Y}" / f"{day:%m}" / f"{day:%d}"
+    folders = [SESSIONS / f"{d:%Y}" / f"{d:%m}" / f"{d:%d}"
+               for d in (datetime.fromtimestamp(now_ts - back * 86400) for back in range(days))]
+    # Un hilo archivado mueve su rollout a archived_sessions (plano); los .zst antiguos no casan.
+    folders.append(ARCHIVED_SESSIONS)
+    for folder in folders:
         try:
             names = os.listdir(folder)
         except OSError:
@@ -195,6 +215,8 @@ def recent_rollouts(hours, now_ts):
                 mtime = os.path.getmtime(path)
             except OSError:
                 continue
+            if now_ts - mtime > hours * 3600:
+                continue
             if m.group(1) not in found or mtime > found[m.group(1)][1]:
                 found[m.group(1)] = (path, mtime)
     return {tid: path for tid, (path, _) in found.items()}
@@ -207,24 +229,38 @@ def _epoch(stamp):
         return None
 
 
+TURN_EVENTS = (b'"task_started"', b'"task_complete"', b'"turn_aborted"', b'"task_aborted"')
+
+
 def turn_state(path):
-    """(estado, fin) del último turno del rollout: running | done | aborted | unknown."""
-    state, ended = "unknown", None
+    """(estado, fin, turno) del último turno del rollout: running | done | aborted | unknown."""
+    state, ended, turn = "unknown", None, None
     for raw in tail_lines(path, limit=2_000_000):
-        if b'"task_started"' not in raw and b'"task_complete"' not in raw and b'"turn_aborted"' not in raw:
+        if not any(k in raw for k in TURN_EVENTS):
             continue
         try:
             o = json.loads(raw)
         except ValueError:
             continue
-        kind = (o.get("payload") or {}).get("type")
+        p = o.get("payload") or {}
+        kind = p.get("type")
         if kind == "task_started":
-            state, ended = "running", None
+            state, ended, turn = "running", None, p.get("turn_id")
         elif kind == "task_complete":
-            state, ended = "done", _epoch(o.get("timestamp"))
-        elif kind == "turn_aborted":
-            state, ended = "aborted", _epoch(o.get("timestamp"))
-    return state, ended
+            state, ended, turn = "done", _epoch(o.get("timestamp")), p.get("turn_id") or turn
+        elif kind in ("turn_aborted", "task_aborted"):
+            state, ended, turn = "aborted", _epoch(o.get("timestamp")), p.get("turn_id") or turn
+    return state, ended, turn
+
+
+def is_unread(state, ended, turn, meta):
+    """Pendiente si el último turno acabó y no es el que se leyó (o, sin id, acabó tras la lectura)."""
+    if state not in ("done", "aborted") or not ended:
+        return False
+    consumed_turn = meta.get("consumed_turn")
+    if turn and consumed_turn:
+        return str(turn) > str(consumed_turn)
+    return ended > (meta.get("consumed_at") or 0)
 
 
 def finished_threads(hours=24, owner=None, now_ts=None):
@@ -240,12 +276,11 @@ def finished_threads(hours=24, owner=None, now_ts=None):
         path = rollouts.get(tid)
         if not path or now_ts - os.path.getmtime(path) > hours * 3600:
             continue
-        state, ended = turn_state(path)
-        consumed = meta.get("consumed_at") or 0
+        state, ended, turn = turn_state(path)
         rows.append({"thread": tid, "title": meta.get("title"), "agent": meta.get("agent"),
                      "from": meta.get("from"), "role": meta.get("role"), "state": state,
                      "ended_at": ended, "activity_at": os.path.getmtime(path),
-                     "unread": state in ("done", "aborted") and bool(ended) and ended > consumed})
+                     "unread": is_unread(state, ended, turn, meta)})
     return sorted(rows, key=lambda r: r["activity_at"])
 
 
@@ -932,11 +967,11 @@ def watch(tid, timeout=3300, path=None, offset=None, turn_id=None, match_text=No
                         emit(f"CODEX: {(it.get('arguments') or {}).get('message', '')}")
                 elif t == "task_complete":
                     emit(f"DONE {now()}: {p.get('last_agent_message') or ''}")
-                    mark_consumed(tid)
+                    mark_consumed(tid, p.get("turn_id"))
                     return 0
                 elif t in ("turn_aborted", "task_aborted"):
                     emit(f"FAILED {now()}: turn {p.get('reason', 'aborted')}")
-                    mark_consumed(tid)
+                    mark_consumed(tid, p.get("turn_id"))
                     return 5
             continue
         if time.time() >= next_check:
@@ -1189,17 +1224,20 @@ def cmd_watch(c, a):
     if not path:
         emit(f"FAILED: no rollout file for {a.thread}")
         return 5
+    seen_at = time.time()  # antes de leer: lo que termine después sigue pendiente
     size = file_size(path)
     lines = tail_lines(path)
     pos = size - sum(len(x) + 1 for x in lines) + 1  # byte offset of the first complete line
-    start_at, ended, answer = None, False, ""
+    start_at, ended, answer, last_turn = None, False, "", None
     for raw in lines:
         if b'"task_started"' in raw:
             start_at, ended = pos, False
-        elif b'"task_complete"' in raw or b'"turn_aborted"' in raw:
+        elif b'"task_complete"' in raw or b'"turn_aborted"' in raw or b'"task_aborted"' in raw:
             ended = True
             try:
-                answer = (json.loads(raw).get("payload") or {}).get("last_agent_message") or ""
+                payload = json.loads(raw).get("payload") or {}
+                answer = payload.get("last_agent_message") or ""
+                last_turn = payload.get("turn_id") or last_turn
             except ValueError:
                 pass
         pos += len(raw) + 1
@@ -1215,7 +1253,7 @@ def cmd_watch(c, a):
         emit(f"WAITING {now()}: " + (f"turn {busy} is starting" if busy else f"{len(waiting)} queued message(s)"))
         return watch(a.thread, a.timeout, path=path, offset=size, turn_id=busy)
     emit("IDLE: no turn running. Last answer: " + answer)
-    mark_consumed(a.thread)
+    mark_consumed(a.thread, last_turn, seen_at)
     return 0
 
 
@@ -1293,6 +1331,7 @@ def cmd_list(c, a):
 
 
 def cmd_read(c, a):
+    seen_at = time.time()  # antes de leer: lo que termine después sigue pendiente
     r = ok(c.call("thread/read", {"threadId": a.thread, "includeTurns": True}), "thread/read")
     t = r["thread"]
     turns = t.get("turns", [])
@@ -1307,7 +1346,7 @@ def cmd_read(c, a):
             elif i.get("type") == "dynamicToolCall":
                 print("send_to_claude:", (i.get("arguments") or {}).get("message", ""))
     if turns and turns[-1].get("status") != "inProgress":
-        mark_consumed(a.thread)
+        mark_consumed(a.thread, turns[-1].get("id"), seen_at)
     return 0
 
 
