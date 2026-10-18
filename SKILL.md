@@ -19,7 +19,9 @@ Un daemon pequeño se inicia al primer uso (`/usr/bin/python3 $B up`, `ping`, `d
 
 ## Desde Claude Code
 
-**No ejecutes `start`, `send` ni `watch` en un Bash en primer plano.** Usa Monitor o `--no-watch` y después `watch` bajo Monitor. Un comando en primer plano bloquea el chat hasta que termina.
+**En la sesión principal, no ejecutes `start`, `send` ni `watch` en un Bash en primer plano.** Usa Monitor o `--no-watch` y después `watch` bajo Monitor. Un comando en primer plano bloquea el chat hasta que termina.
+
+**Un subagente (Agent tool) hace lo contrario: `watch` en primer plano, nunca Monitor.** El aviso de un Monitor o de un comando en segundo plano no despierta a un subagente idle: el 18-oct uno terminó a las 00:44 y no se leyó hasta las 03:21. Usa `start ... --no-watch` y después `watch <thread> --timeout 540` en primer plano, repitiéndolo mientras salga `TIMEOUT` (el Bash en primer plano corta a los 10 min). Pasa siempre `--agent <tu nombre>`: con él `finished` y el vigilante nocturno saben a quién despertar.
 
 **Codex no toma el control de la pantalla.** Cada tarea `start` lleva instrucciones de desarrollador (`INSTRUCTIONS` en `scripts/bridge.py`): no eleva ni enfoca ventanas, no mueve el puntero, usa solo navegador headless, un navegador por tarea y páginas como pestañas. El uso de computadora en primer plano exige `FOREGROUND AUTHORIZED` en el prompt con la aplicación y acción exactas.
 
@@ -35,12 +37,13 @@ Un daemon pequeño se inicia al primer uso (`/usr/bin/python3 $B up`, `ping`, `d
 | Añadir texto a un turno / detenerlo | `steer <thread> "text"` / `stop <thread>`: para hilos gestionados por este bridge y, mediante la aplicación, para hilos abiertos allí |
 | Entrega inmediata a hilos de la aplicación | `/usr/bin/python3 $B app-connect`: una vez por lanzamiento de ChatGPT; después los verbos para hilos abiertos pasan por la aplicación |
 | Buscar y leer | `list [--search T] [--archived]`, `read <thread> [--turns N]`, `status <thread>` (escritor, último turno, cola) |
+| Hilos terminados sin leer | `/usr/bin/python3 $B finished --unread [--owner <sessionId>] [--json]`: último turno de cada hilo registrado; `SIN LEER` si acabó después del último `watch`/`read`. No usa el daemon |
 | Gestionar | `rename`, `fork`, `archive`, `unarchive`, `sections`, `move <thread> <section>`, `settings <thread> --model M --effort E`, `goal <thread> ["objective"] [--clear]`, `queue <thread> [--delete ID]` |
 | Herramientas MCP de Codex | `mcp [server]` lista las herramientas; `mcp-call <server> <tool> '{args}' [--thread T]` llama una sin turno de agente |
 | Cualquier otro método | `rpc <method> '{params}'`: todos los métodos del app-server |
 | Comprobar una actualización | `/usr/bin/python3 $B doctor [--verbose]`: read-only; informa `{ok, missing, codex_version, daemon}` y no inicia daemon ni turno |
 
-Desde `start`, las respuestas vuelven a esta sesión (`--from` toma por defecto su identificador). Los nuevos hilos aparecen en la barra lateral de ChatGPT en su refresco de un minuto. Usa el enlace `codex://threads/<id>` de la línea `THREAD`.
+Desde `start`, las respuestas vuelven a esta sesión (`--from` toma por defecto su identificador: `CLAUDE_CODE_HOST_SESSION_ID` o, si falta, `CLAUDE_CODE_SESSION_ID`; `--agent` o `CLAUDE_CODEX_BRIDGE_AGENT` guarda el subagente que espera). `watch` y `read` anotan en `threads.json` cuándo se leyó el final del turno. Los nuevos hilos aparecen en la barra lateral de ChatGPT en su refresco de un minuto. Usa el enlace `codex://threads/<id>` de la línea `THREAD`.
 
 Líneas del stream: `THREAD`, `SENT`, `QUEUED`, `WAITING`, `STARTED`, `AGENT:` (texto del agente), `CODEX:` (el agente llamó a `send_to_claude`), `DONE <time>: <final answer>`, `FAILED`, `TIMEOUT` (sigue ejecutándose; vuelve a usar `watch`). Un `watch` termina por sí solo si ningún proceso ha tenido el hilo durante 30 s. Para respuestas largas, ejecuta `read <thread> --turns 1` después de `DONE`.
 
