@@ -95,7 +95,10 @@ class TidyTests(unittest.TestCase):
         self.home.mkdir()
         self.threads_path = self.home / "threads.json"
         self.log_path = self.home / "events.jsonl"
-        self.globals = patch.multiple(bridge, HOME=self.home, THREADS=self.threads_path, LOG=self.log_path)
+        self.archived_dir = Path(self.temp.name) / "archived_sessions"
+        self.archived_dir.mkdir()
+        self.globals = patch.multiple(bridge, HOME=self.home, THREADS=self.threads_path, LOG=self.log_path,
+                                      ARCHIVED_SESSIONS=self.archived_dir)
         self.globals.start()
 
     def tearDown(self):
@@ -167,6 +170,45 @@ class TidyTests(unittest.TestCase):
         rows = [json.loads(line) for line in self.log_path.read_text().splitlines()]
         self.assertEqual([row["thread"] for row in rows if row["event"] == "tidy"], ["works"])
         self.assertIn("archived_at", json.loads(self.threads_path.read_text())["works"])
+
+    def test_tidy_reconciles_thread_already_archived_on_disk(self):
+        tid = "01a1069a-cac3-7701-b5aa-b26226d175cb"
+        self.records((tid, "works"))
+        (self.archived_dir / f"rollout-2026-10-04T13-09-30-{tid}.jsonl.zst").write_text("")
+        # El app-server del daemon sigue creyendo que no está archivado.
+        client = TidyClient({tid: self.thread(tid), "works": self.thread("works")},
+                            archive_failures={tid})
+
+        bridge.cmd_tidy(client, tidy_args())
+
+        self.assertEqual(self.archived_ids(client), ["works"])
+        records = json.loads(self.threads_path.read_text())
+        self.assertIn("archived_at", records[tid])
+        rows = [json.loads(line) for line in self.log_path.read_text().splitlines()]
+        self.assertIn({"event": "tidy_reconciled", "thread": tid}, [
+            {k: v for k, v in row.items() if k != "at"} for row in rows])
+
+    def test_tidy_dry_run_does_not_reconcile(self):
+        tid = "01a1069a-cac3-7701-b5aa-b26226d175cb"
+        self.records((tid,))
+        (self.archived_dir / f"rollout-2026-10-04T13-09-30-{tid}.jsonl").write_text("")
+        client = TidyClient({tid: self.thread(tid)})
+
+        bridge.cmd_tidy(client, tidy_args(dry_run=True))
+
+        self.assertNotIn("archived_at", json.loads(self.threads_path.read_text())[tid])
+        self.assertEqual(self.archived_ids(client), [])
+
+    def test_tidy_logs_failures_even_when_quiet(self):
+        self.records(("fails",))
+        client = TidyClient({"fails": self.thread("fails")}, archive_failures={"fails"})
+
+        bridge.cmd_tidy(client, argparse.Namespace(hours=24, dry_run=False, quiet=True))
+
+        rows = [json.loads(line) for line in self.log_path.read_text().splitlines()]
+        failed = [row for row in rows if row["event"] == "tidy_failed"]
+        self.assertEqual([row["thread"] for row in failed], ["fails"])
+        self.assertIn("archive failed", failed[0]["error"])
 
     def test_tidy_rereads_before_archive_and_skips_when_age_changed(self):
         self.records(("changed",))

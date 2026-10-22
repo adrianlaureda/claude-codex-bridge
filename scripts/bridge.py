@@ -188,6 +188,7 @@ def mark_consumed(tid, turn_id=None, seen_at=None):
         os.close(lock)
 
 
+ROLLOUT_ID = re.compile(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:_\d+)?\.jsonl(?:\.zst)?$")
 ROLLOUT_NAME = re.compile(r"rollout-.*?([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:_\d+)?\.jsonl$")
 
 
@@ -1478,7 +1479,24 @@ def _tidy_lock():
     return fd
 
 
-def _tidy_one(c, tid, cutoff, dry_run, silent):
+def _archived_rollout_ids():
+    """Hilos cuyo rollout ya está en archived_sessions (archivados desde la app o por otro proceso).
+
+    El app-server del daemon puede tener el hilo en memoria y seguir diciendo archived=false;
+    el disco es la fuente fiable y evita un thread/archive que fallaría con «no rollout found»."""
+    try:
+        names = os.listdir(ARCHIVED_SESSIONS)
+    except OSError:
+        return set()
+    ids = set()
+    for name in names:
+        m = ROLLOUT_ID.search(name)
+        if m:
+            ids.add(m.group(1))
+    return ids
+
+
+def _tidy_one(c, tid, cutoff, dry_run, silent, archived_on_disk=frozenset()):
     """Relee registro e hilo bajo locks justo antes de decidir el archive."""
     lock = _thread_lock()
     try:
@@ -1486,6 +1504,18 @@ def _tidy_one(c, tid, cutoff, dry_run, silent):
         record = records.get(tid) if isinstance(records, dict) else None
         if not isinstance(record, dict) or record.get("archived_at") or record.get("keep") is True:
             return "skipped"
+        if tid in archived_on_disk:
+            # Ya archivado fuera del bridge: solo se anota para no volver a intentarlo en cada tidy.
+            if dry_run:
+                if not silent:
+                    print(f"WOULD RECONCILE {tid}")
+                return "skipped"
+            record["archived_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            _write_threads(records)
+            append(LOG, {"event": "tidy_reconciled", "thread": tid})
+            if not silent:
+                print(f"RECONCILED {tid}")
+            return "reconciled"
 
         # La lista sirve para descubrir candidatos; esta lectura es la comprobación TOCTOU.
         response = c.call("thread/read", {"threadId": tid, "includeTurns": True}, timeout=10)
@@ -1559,18 +1589,24 @@ def cmd_tidy(c, a, silent=False, lock=None):
                 _tidy_warn("*", compact_error(exc), silent)
                 break
 
+        archived_on_disk = _archived_rollout_ids()
+        reconciled = 0
         for tid in tids:
             try:
-                result = _tidy_one(c, tid, cutoff, a.dry_run, silent)
+                result = _tidy_one(c, tid, cutoff, a.dry_run, silent, archived_on_disk)
                 if result == "archived":
                     archived += 1
+                elif result == "reconciled":
+                    reconciled += 1
                 else:
                     skipped += 1
             except Exception as exc:
                 failed += 1
                 _tidy_warn(tid, compact_error(exc), silent)
+                # El autotidy corre con --quiet: sin esta línea los fallos no dejan rastro.
+                append(LOG, {"event": "tidy_failed", "thread": tid, "error": compact_error(exc)})
         if not silent:
-            print(f"TIDY archived={archived} skipped={skipped} failed={failed}")
+            print(f"TIDY archived={archived} reconciled={reconciled} skipped={skipped} failed={failed}")
         return 0
     finally:
         if own_lock:
