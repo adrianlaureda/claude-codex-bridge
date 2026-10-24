@@ -83,8 +83,11 @@ class StartPolicyTests(unittest.TestCase):
         self.paths.start()
         self.autotidy = patch.dict(os.environ, {"CLAUDE_CODEX_BRIDGE_AUTOTIDY": "0"})
         self.autotidy.start()
+        self.ping_patch = patch.object(bridge, "ping", return_value=None)
+        self.ping_patch.start()
 
     def tearDown(self):
+        self.ping_patch.stop()
         self.autotidy.stop()
         self.paths.stop()
         self.temp.cleanup()
@@ -285,12 +288,34 @@ class StartPolicyTests(unittest.TestCase):
             self.assertEqual(bridge.cmd_start(client, args), 0)
 
         popen.assert_called_once_with(
-            [sys.executable, str(Path(bridge.__file__).resolve()), "tidy", "--hours", "24", "--quiet"],
+            [sys.executable, str(Path(bridge.__file__).resolve()), "tidy", "--hours", "8", "--quiet"],
             stdin=bridge.subprocess.DEVNULL, stdout=bridge.subprocess.DEVNULL,
             stderr=bridge.subprocess.DEVNULL, start_new_session=True,
         )
         popen.return_value.wait.assert_not_called()
         tidy.assert_not_called()
+
+    def test_autotidy_uses_environment_threshold(self):
+        client = FakeClient()
+        args = start_args(self.cwd)
+        with patch.dict(os.environ, {"CLAUDE_CODEX_BRIDGE_AUTOTIDY": "1",
+                                     "CLAUDE_CODEX_BRIDGE_TIDY_HOURS": "6"}), \
+             patch.object(bridge, "route_model", return_value={"model": "gpt-test", "effort": "low"}), \
+             patch.object(bridge, "save_thread"), patch.object(bridge, "append"), \
+             patch.object(bridge, "set_title"), patch.object(bridge, "watch"), \
+             patch.object(bridge.subprocess, "Popen") as popen:
+            self.assertEqual(bridge.cmd_start(client, args), 0)
+
+        self.assertEqual(popen.call_args.args[0][-4:], ["tidy", "--hours", "6", "--quiet"])
+
+    def test_start_with_live_daemon_does_not_launch_duplicate_tidy(self):
+        with patch.dict(os.environ, {"CLAUDE_CODEX_BRIDGE_AUTOTIDY": "1"}), \
+             patch.object(bridge, "ping", return_value={"pid": 123}), \
+             patch.object(bridge, "route_model", return_value={"model": "test", "effort": "low"}), \
+             patch.object(bridge, "save_thread"), patch.object(bridge, "append"), \
+             patch.object(bridge.subprocess, "Popen") as popen:
+            self.assertEqual(bridge.cmd_start(FakeClient(), start_args(self.cwd)), 0)
+        popen.assert_not_called()
 
     def test_send_unarchives_destination_before_turn(self):
         client = FakeClient()
@@ -304,6 +329,46 @@ class StartPolicyTests(unittest.TestCase):
 
         methods = [method for method, _, _ in client.calls]
         self.assertLess(methods.index("thread/unarchive"), methods.index("turn/start"))
+
+    def test_keep_after_confirmed_reopening(self):
+        for operation in ("send", "watch", "unarchive", "rpc"):
+            with self.subTest(operation=operation):
+                bridge.save_thread("thread-1", archived_at="2026-10-24T00:00:00Z")
+                client = FakeClient()
+                client.archived = True
+                args = argparse.Namespace(cmd=operation, thread="thread-1", prompt="sigue",
+                                          model=None, effort=None, no_watch=True, timeout=1)
+                with patch.object(bridge, "rollout_path", return_value=None), \
+                     patch.object(bridge, "held_by_app", return_value=False):
+                    if operation == "send":
+                        self.assertEqual(bridge.cmd_send(client, args), 0)
+                    elif operation == "watch":
+                        bridge.cmd_watch(client, args)
+                    elif operation == "rpc":
+                        args.method = "thread/unarchive"
+                        args.params = '{"threadId":"thread-1"}'
+                        self.assertEqual(bridge.cmd_rpc(client, args), 0)
+                    else:
+                        self.assertEqual(bridge.cmd_simple(client, args), 0)
+                self.assertNotIn("archived_at", bridge.load_threads()["thread-1"])
+                self.assertEqual(bridge.cmd_keep(args, True), 0)
+
+    def test_failed_reopening_preserves_archive_marker(self):
+        bridge.save_thread("thread-1", archived_at="previous")
+        client = FakeClient()
+        client.archived = True
+        with patch.object(bridge, "call_held", return_value={"error": {"message": "fallo sintético"}}):
+            with self.assertRaises(SystemExit):
+                bridge.ensure_unarchived(client, "thread-1")
+        self.assertEqual(bridge.load_threads()["thread-1"]["archived_at"], "previous")
+
+    def test_live_read_reconciles_stale_archive_marker(self):
+        bridge.save_thread("thread-1", archived_at="previous", keep=False)
+        client = FakeClient()
+        lock = bridge.ensure_unarchived(client, "thread-1")
+        bridge._release_thread_lock(lock)
+        self.assertNotIn("archived_at", bridge.load_threads()["thread-1"])
+        self.assertFalse(bridge.load_threads()["thread-1"]["keep"])
 
     def test_send_retries_turn_start_once_after_archived_error(self):
         client = FakeClient(fail_turn_archived_once=True)
