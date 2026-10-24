@@ -21,7 +21,7 @@ CLAUDE -> CODEX
   bridge.py watch <thread> [--timeout S] [--from-start]   stream until the current turn ends
   bridge.py steer <thread> "text"            add input to the running turn (bridge-held threads)
   bridge.py stop <thread>                    interrupt the running turn (bridge-held threads)
-  bridge.py tidy [--hours 24] [--dry-run] [--quiet]
+  bridge.py tidy [--hours 8] [--dry-run] [--quiet]
                                              archive old registered, idle bridge threads
   bridge.py keep <thread> | unkeep <thread> protect or unprotect a registered thread from tidy
   bridge.py list [--limit N] [--search TEXT] [--archived]
@@ -51,7 +51,7 @@ CODEX -> CLAUDE
 DAEMON
   bridge.py up | down | ping
 """
-import argparse, fcntl, glob, json, os, queue, re, socket, socketserver, subprocess, sys, threading, time, uuid
+import argparse, fcntl, glob, json, math, os, queue, re, socket, socketserver, subprocess, sys, threading, time, uuid
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -66,6 +66,9 @@ LOG = HOME / "events.jsonl"
 SESSIONS = Path.home() / ".codex" / "sessions"
 ARCHIVED_SESSIONS = Path.home() / ".codex" / "archived_sessions"
 LOCKED = "already has an active writer"
+DEFAULT_TIDY_HOURS = 8
+TIDY_HOURS_ENV = "CLAUDE_CODEX_BRIDGE_TIDY_HOURS"
+TIDY_INTERVAL_SECONDS = 3600
 
 TOOL = {
     "type": "function", "name": "send_to_claude",
@@ -102,6 +105,23 @@ def now():
     return datetime.now().strftime("%H:%M:%S")
 
 
+def tidy_hours(value=None):
+    """Devuelve el umbral de limpieza; la opción explícita prevalece sobre el entorno."""
+    raw = value if value is not None else os.environ.get(TIDY_HOURS_ENV, DEFAULT_TIDY_HOURS)
+    try:
+        hours = float(raw)
+    except (TypeError, ValueError):
+        hours = float(DEFAULT_TIDY_HOURS)
+    if not math.isfinite(hours):
+        hours = float(DEFAULT_TIDY_HOURS)
+    return max(0, hours)
+
+
+def tidy_hours_arg(value=None):
+    """Formatea el umbral para una invocación hija sin perder decimales válidos."""
+    return f"{tidy_hours(value):g}"
+
+
 def emit(line):
     print(line.replace("\n", " ⏎ "), flush=True)
 
@@ -136,11 +156,31 @@ def load_threads():
         return {}
 
 
-def _thread_lock():
+def _remaining(deadline):
+    remaining = deadline - time.monotonic()
+    if not math.isfinite(remaining) or remaining <= 0:
+        raise TimeoutError("petición vencida; no se inicia ninguna operación")
+    return remaining
+
+
+def _thread_lock(deadline=None):
     HOME.mkdir(parents=True, exist_ok=True)
     fd = os.open(HOME / "threads.lock", os.O_RDWR | os.O_CREAT, 0o600)
-    fcntl.flock(fd, fcntl.LOCK_EX)
-    return fd
+    try:
+        if deadline is None:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        else:
+            while True:
+                _remaining(deadline)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    time.sleep(min(0.01, _remaining(deadline)))
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
 
 
 def _write_threads(data):
@@ -394,6 +434,7 @@ class AppServer:
             sys.exit(f"Codex binary not found at {CODEX}. Set CODEX_BIN.")
         self.on_request, self.on_note = on_request, on_note
         self.n, self.waiting, self.wlock = 0, {}, threading.Lock()
+        self.pending_archives = {}  # hilo → respuesta aún pendiente tras un timeout
         self.p, self._stderr_thread = None, None
         self._pump_done = threading.Event()
         self._stderr_state = {"lines": 0, "error": None}
@@ -545,6 +586,13 @@ class AppServer:
     def call(self, method, params, timeout=60, proc=None, waiting=None):
         proc = proc or self.p
         waiting = waiting if waiting is not None else self.waiting
+        tid = params.get("threadId")
+        pending = self.pending_archives.get(tid)
+        if method == "thread/read" and pending is not None:
+            # Leer archived=False antes de que termine archive no confirma nada.
+            if pending.empty():
+                return {"error": {"message": "archive pendiente; no se puede conciliar todavía"}}
+            self.pending_archives.pop(tid)
         with self.wlock:
             self.n += 1
             i = self.n
@@ -565,8 +613,14 @@ class AppServer:
         try:
             return q.get(timeout=timeout)
         except queue.Empty:
-            waiting.pop(i, None)
-            return {"error": {"message": f"{method}: no response in {timeout}s"}}
+            error = {"message": f"{method}: no response in {timeout}s"}
+            if method == "thread/archive":
+                # El envío ya se completó: conservar la respuesta tardía, nunca reenviar.
+                self.pending_archives[tid] = q
+                error["data"] = {"archive_uncertain": True}
+            else:
+                waiting.pop(i, None)
+            return {"error": error}
 
     def close(self):
         proc = self.p
@@ -618,7 +672,10 @@ class Daemon:
         self.touched = {}                      # threadId -> last use
         self.inflight = defaultdict(int)       # threadId -> calls in progress on its worker
         self.tlocks = defaultdict(threading.Lock)  # one worker start per thread at a time
+        self.cycle_locks = defaultdict(threading.RLock)  # decisión de tidy y todos los RPC del hilo
         self.lock = threading.Lock()
+        self._tidy_stop = threading.Event()
+        self._tidy_thread = None
         threading.Thread(target=self._reap, daemon=True).start()
 
     @property
@@ -645,6 +702,37 @@ class Daemon:
                 if attempt:
                     raise
 
+    def call(self, method, params=None, timeout=60):
+        """Expone la interfaz de Client para el barrido en segundo plano."""
+        request = dict(params or {})
+        request["_timeout"] = timeout
+        return self.rpc(method, request)
+
+    def _periodic_tidy(self):
+        while not self._tidy_stop.is_set():
+            try:
+                if os.environ.get("CLAUDE_CODEX_BRIDGE_AUTOTIDY", "1").strip() != "0":
+                    result = cmd_tidy(self, argparse.Namespace(hours=tidy_hours(), dry_run=False, quiet=True), silent=True)
+                    if result:
+                        raise RuntimeError("el barrido terminó con errores; ver tidy_failed")
+            except (Exception, SystemExit) as exc:
+                append(LOG, {"event": "tidy_daemon_failed", "error": compact_error(exc)})
+            if self._tidy_stop.wait(TIDY_INTERVAL_SECONDS):
+                return
+
+    def start_periodic_tidy(self):
+        """Inicia la limpieza en un hilo independiente de las peticiones RPC."""
+        if self._tidy_thread and self._tidy_thread.is_alive():
+            return
+        self._tidy_stop.clear()
+        self._tidy_thread = threading.Thread(target=self._periodic_tidy, name="bridge-tidy", daemon=True)
+        self._tidy_thread.start()
+
+    def stop_periodic_tidy(self):
+        self._tidy_stop.set()
+        if self._tidy_thread and self._tidy_thread is not threading.current_thread():
+            self._tidy_thread.join(timeout=1)
+
     def note(self, o):
         m, p = o.get("method"), o.get("params") or {}
         tid = p.get("threadId")
@@ -667,6 +755,7 @@ class Daemon:
                         self.workers.pop(tid)
                         self.running.pop(tid, None)
                     elif (w.p.poll() is None and tid not in self.running and not self.inflight[tid]
+                          and not w.pending_archives
                           and time.time() - self.touched.get(tid, 0) > IDLE_CLOSE):
                         self.workers.pop(tid).close()
 
@@ -692,7 +781,41 @@ class Daemon:
             return w, None
 
     def rpc(self, method, params):
-        timeout = params.pop("_timeout", 60)
+        params = dict(params)
+        deadline = min(params.get("_deadline", float("inf")),
+                       time.monotonic() + params.get("_timeout", 60))
+        _remaining(deadline)
+        params["_deadline"] = deadline
+        tid = params.get("threadId")
+        # Solo tidy posee aquí el registro: siempre threads.lock → cycle_lock.
+        # send/watch ya protegen su reapertura con threads.lock en el cliente.
+        registry_lock = _thread_lock(deadline) if method == "bridge/tidy-archive" else None
+        try:
+            if tid:
+                cycle = self.cycle_locks[tid]
+                if not cycle.acquire(timeout=_remaining(deadline)):
+                    raise TimeoutError("petición vencida esperando cycle_lock")
+                try:
+                    _remaining(deadline)
+                    self.inflight[tid] += 1
+                    try:
+                        return self._rpc(method, params)
+                    finally:
+                        self.inflight[tid] -= 1
+                finally:
+                    cycle.release()
+            return self._rpc(method, params)
+        finally:
+            if registry_lock is not None:
+                _release_thread_lock(registry_lock)
+
+    def _rpc(self, method, params):
+        deadline = params.pop("_deadline")
+        timeout = min(params.pop("_timeout", 60), _remaining(deadline))
+        if method == "bridge/tidy-archive":
+            status = _tidy_registered(self, params["threadId"], params["cutoff"],
+                                      params.get("dryRun", False), deadline)
+            return {"result": {"status": status}}
         if method == "bridge/ping":
             return {"result": {"pid": os.getpid(), "running": self.running, "workers": list(self.workers)}}
         if method == "bridge/running":
@@ -789,6 +912,7 @@ def serve():
         sys.exit("bridge daemon already running")
     SOCK.unlink(missing_ok=True)
     d = Daemon()
+    d.start_periodic_tidy()
 
     class H(socketserver.StreamRequestHandler):
         def handle(self):
@@ -817,6 +941,7 @@ def serve():
     try:
         s.serve_forever()
     finally:
+        d.stop_periodic_tidy()
         SOCK.unlink(missing_ok=True)
 
 
@@ -861,6 +986,7 @@ class Client:
     def call(self, method, params=None, timeout=60):
         params = dict(params or {})
         params["_timeout"] = timeout
+        params["_deadline"] = min(params.get("_deadline", float("inf")), time.monotonic() + timeout)
         self.c.settimeout(timeout + 15)  # a stuck daemon never hangs the command
         try:
             self.c.sendall((json.dumps({"method": method, "params": params}) + "\n").encode())
@@ -999,13 +1125,13 @@ def file_size(path):
 
 # ---------------------------------------------------------------- commands
 
-def held_by_app(c, tid):
+def held_by_app(c, tid, deadline=None):
     """Resume through the daemon. Returns True when another process (the ChatGPT app) is the writer."""
-    r = c.call("thread/resume", {"threadId": tid})
+    r = _tidy_call(c, "thread/resume", {"threadId": tid}, 60, deadline)
     if "error" in r:
         if LOCKED in r["error"].get("message", ""):
             return True
-        ok(r, "thread/resume")
+        raise RuntimeError(r["error"].get("message", "thread/resume falló"))
     return False
 
 
@@ -1084,12 +1210,14 @@ def set_title(c, tid, title):
 
 
 def launch_autotidy():
-    """Lanza la limpieza en segundo plano y no hace esperar al start."""
+    """Respaldo sin daemon; con daemon vivo basta su barrido periódico."""
     if os.environ.get("CLAUDE_CODEX_BRIDGE_AUTOTIDY", "1").strip() == "0":
+        return
+    if ping():
         return
     try:
         subprocess.Popen(
-            [sys.executable, os.path.abspath(__file__), "tidy", "--hours", "24", "--quiet"],
+            [sys.executable, os.path.abspath(__file__), "tidy", "--hours", tidy_hours_arg(), "--quiet"],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
@@ -1102,6 +1230,15 @@ def _release_thread_lock(lock):
     os.close(lock)
 
 
+def _clear_archived_locked(tid):
+    """Reconcilia una reapertura confirmada; el llamador posee threads.lock."""
+    records = load_threads()
+    record = records.get(tid) if isinstance(records, dict) else None
+    if isinstance(record, dict) and "archived_at" in record:
+        record.pop("archived_at")
+        _write_threads(records)
+
+
 def _ensure_unarchived_locked(c, tid, force=False):
     """Reabre un hilo archivado antes de continuar un encargo sobre él."""
     r = c.call("thread/read", {"threadId": tid}, timeout=10)
@@ -1110,7 +1247,10 @@ def _ensure_unarchived_locked(c, tid, force=False):
     thread = (r.get("result") or {}).get("thread")
     if force or (isinstance(thread, dict) and thread.get("archived") is True):
         ok(call_held(c, "thread/unarchive", {"threadId": tid}), "thread/unarchive")
+        _clear_archived_locked(tid)
         emit(f"UNARCHIVED {tid}")
+    elif isinstance(thread, dict) and thread.get("archived") is False:
+        _clear_archived_locked(tid)
 
 
 def ensure_unarchived(c, tid):
@@ -1455,9 +1595,16 @@ def _tidy_warn(tid, message, silent):
         emit(f"WARN: tidy {tid}: {message}")
 
 
-def _tidy_active(c, tid, thread):
-    """Comprueba tanto los turnos del hilo como los que el bridge tiene en ejecución."""
-    running = c.call("bridge/running", {"threadId": tid}, timeout=5)
+def _tidy_call(c, method, params, timeout, deadline):
+    if deadline is not None:
+        timeout = min(timeout, _remaining(deadline))
+        params = dict(params, _deadline=deadline)
+    return c.call(method, params, timeout=timeout)
+
+
+def _tidy_active(c, tid, thread, deadline=None):
+    """Comprueba turnos activos y envíos pendientes antes de archivar."""
+    running = _tidy_call(c, "bridge/running", {"threadId": tid}, 5, deadline)
     if "error" in running:
         raise RuntimeError(running["error"].get("message", "bridge/running falló"))
     if (running.get("result") or {}).get("turnId"):
@@ -1465,6 +1612,11 @@ def _tidy_active(c, tid, thread):
     for turn in (thread or {}).get("turns") or []:
         if str(turn.get("status", "")).lower() in {"inprogress", "in_progress", "running", "started"}:
             return True
+    queued = _tidy_call(c, "thread/queue/list", {"threadId": tid}, 5, deadline)
+    if "error" in queued:
+        raise RuntimeError(queued["error"].get("message", "thread/queue/list falló"))
+    if (queued.get("result") or {}).get("data"):
+        return True
     return False
 
 
@@ -1479,14 +1631,18 @@ def _tidy_lock():
     return fd
 
 
-def _archived_rollout_ids():
+def _archived_rollout_ids(strict=False):
     """Hilos cuyo rollout ya está en archived_sessions (archivados desde la app o por otro proceso).
 
     El app-server del daemon puede tener el hilo en memoria y seguir diciendo archived=false;
     el disco es la fuente fiable y evita un thread/archive que fallaría con «no rollout found»."""
     try:
         names = os.listdir(ARCHIVED_SESSIONS)
+    except FileNotFoundError:
+        return set()  # Sin directorio de archivados todavía no hay rollouts archivados.
     except OSError:
+        if strict:
+            raise  # Conciliar exige verificar el disco, no asumir que está vacío.
         return set()
     ids = set()
     for name in names:
@@ -1496,56 +1652,102 @@ def _archived_rollout_ids():
     return ids
 
 
-def _tidy_one(c, tid, cutoff, dry_run, silent, archived_on_disk=frozenset()):
-    """Relee registro e hilo bajo locks justo antes de decidir el archive."""
-    lock = _thread_lock()
-    try:
-        records = load_threads()
-        record = records.get(tid) if isinstance(records, dict) else None
-        if not isinstance(record, dict) or record.get("archived_at") or record.get("keep") is True:
-            return "skipped"
-        if tid in archived_on_disk:
-            # Ya archivado fuera del bridge: solo se anota para no volver a intentarlo en cada tidy.
-            if dry_run:
-                if not silent:
-                    print(f"WOULD RECONCILE {tid}")
-                return "skipped"
+def _tidy_archive(c, tid, cutoff, dry_run, deadline=None):
+    """Decide y archiva dentro del lock de ciclo del daemon, conservando el writer."""
+    if held_by_app(c, tid, deadline):
+        return "skipped"
+    response = _tidy_call(c, "thread/read", {"threadId": tid, "includeTurns": True}, 10, deadline)
+    if "error" in response:
+        raise RuntimeError(response["error"].get("message", "thread/read falló"))
+    thread = _thread_from_response(response)
+    if not thread:
+        raise RuntimeError("thread/read no devolvió el hilo")
+    if thread.get("archived") is True or _tidy_active(c, tid, thread, deadline):
+        return "skipped"
+    activity = _timestamp(thread.get("recencyAt") or thread.get("updatedAt"))
+    if activity is None or activity > cutoff:
+        return "skipped"
+    if dry_run:
+        return "would_archive"
+    # Nunca reenviar a la app: su writer debe impedir este archivado automático.
+    response = _tidy_call(c, "thread/archive", {"threadId": tid}, 60, deadline)
+    if ((response.get("error") or {}).get("data") or {}).get("archive_uncertain"):
+        return "uncertain"
+    if LOCKED in ((response.get("error") or {}).get("message") or ""):
+        return "skipped"
+    if "error" in response:
+        raise RuntimeError(response["error"].get("message", "thread/archive falló"))
+    return "archived"
+
+
+def _reconcile_archive(c, tid, records, deadline=None, dry_run=False):
+    """Conciliación bajo threads.lock; un fallo conserva la marca y no permite keep."""
+    response = _tidy_call(c, "thread/read", {"threadId": tid}, 10, deadline)
+    if "error" in response:
+        raise RuntimeError(response["error"].get("message", "no se pudo conciliar archive"))
+    thread = _thread_from_response(response)
+    if not thread or not isinstance(thread.get("archived"), bool):
+        raise RuntimeError("thread/read no confirmó si el hilo está archivado")
+    disk_archived = tid in _archived_rollout_ids(strict=True)
+    archived = thread["archived"] or disk_archived
+    if not dry_run:
+        record = records[tid]
+        # Cualquier evidencia de archivado protege el hilo; solo el acuerdo resuelve la marca.
+        if thread["archived"] == disk_archived:
+            record.pop("archive_uncertain", None)
+        if archived:
             record["archived_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-            _write_threads(records)
-            append(LOG, {"event": "tidy_reconciled", "thread": tid})
-            if not silent:
-                print(f"RECONCILED {tid}")
-            return "reconciled"
+        else:
+            record.pop("archived_at", None)
+        _write_threads(records)
+        append(LOG, {"event": "archive_reconciled", "thread": tid, "archived": archived})
+    return archived
 
-        # La lista sirve para descubrir candidatos; esta lectura es la comprobación TOCTOU.
-        response = c.call("thread/read", {"threadId": tid, "includeTurns": True}, timeout=10)
-        if "error" in response:
-            raise RuntimeError(response["error"].get("message", "thread/read falló"))
-        thread = _thread_from_response(response)
-        if not thread:
-            raise RuntimeError("thread/read no devolvió el hilo")
-        if thread.get("archived") is True or _tidy_active(c, tid, thread):
-            return "skipped"
-        activity = _timestamp(thread.get("recencyAt") or thread.get("updatedAt"))
-        if activity is None or activity > cutoff:
-            return "skipped"
-        if dry_run:
-            if not silent:
-                print(f"WOULD ARCHIVE {tid}")
-            return "skipped"
 
-        response = call_held(c, "thread/archive", {"threadId": tid})
-        if "error" in response:
-            raise RuntimeError(response["error"].get("message", "thread/archive falló"))
+def _tidy_registered(c, tid, cutoff, dry_run, deadline):
+    """El daemon posee threads.lock y cycle_lock hasta confirmar y anotar el resultado."""
+    _remaining(deadline)
+    records = load_threads()
+    record = records.get(tid) if isinstance(records, dict) else None
+    if not isinstance(record, dict):
+        return "skipped"
+    if record.get("archive_uncertain"):
+        archived = _reconcile_archive(c, tid, records, deadline, dry_run)
+        # Este barrido solo concilia; no vuelve a enviar el archive incierto.
+        return "reconciled" if archived and not dry_run else "skipped"
+    if record.get("archived_at") or record.get("keep") is True:
+        return "skipped"
+    if tid in _archived_rollout_ids():
+        _remaining(deadline)
+        status = "skipped" if dry_run else "reconciled"
+    else:
+        status = _tidy_archive(c, tid, cutoff, dry_run, deadline)
+    if status == "uncertain":
+        record["archive_uncertain"] = True
+        _write_threads(records)
+        append(LOG, {"event": "archive_uncertain", "thread": tid})
+        raise RuntimeError("archive enviado sin respuesta; pendiente de conciliación")
+    if status in ("archived", "reconciled"):
+        # Tras un archive confirmado se persiste incluso si su respuesta agotó el plazo.
         record["archived_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
         _write_threads(records)
-        append(LOG, {"event": "tidy", "thread": tid})
-        if not silent:
-            print(f"ARCHIVED {tid}")
-        return "archived"
-    finally:
-        fcntl.flock(lock, fcntl.LOCK_UN)
-        os.close(lock)
+        append(LOG, {"event": "tidy" if status == "archived" else "tidy_reconciled", "thread": tid})
+    return status
+
+
+def _tidy_one(c, tid, cutoff, dry_run, silent):
+    """El cliente solo solicita y muestra el resultado; no retiene threads.lock."""
+    response = c.call("bridge/tidy-archive", {"threadId": tid, "cutoff": cutoff, "dryRun": dry_run},
+                      timeout=180)
+    if "error" in response:
+        raise RuntimeError(response["error"].get("message", "bridge/tidy-archive falló"))
+    status = (response.get("result") or {}).get("status")
+    labels = {"archived": "ARCHIVED", "reconciled": "RECONCILED", "would_archive": "WOULD ARCHIVE"}
+    if status not in (*labels, "skipped"):
+        raise RuntimeError("bridge/tidy-archive no confirmó el resultado")
+    if not silent and status in labels:
+        print(f"{labels[status]} {tid}")
+    return status
 
 
 def cmd_tidy(c, a, silent=False, lock=None):
@@ -1560,8 +1762,8 @@ def cmd_tidy(c, a, silent=False, lock=None):
         if not isinstance(records, dict):
             records = {}
         tids = [tid for tid, record in records.items()
-                if isinstance(record, dict) and not record.get("archived_at")]
-        cutoff = time.time() - max(0, a.hours) * 3600
+                if isinstance(record, dict) and (record.get("archive_uncertain") or not record.get("archived_at"))]
+        cutoff = time.time() - tidy_hours(getattr(a, "hours", None)) * 3600
         archived = skipped = failed = 0
         listed = {}
         cursor = None
@@ -1589,11 +1791,10 @@ def cmd_tidy(c, a, silent=False, lock=None):
                 _tidy_warn("*", compact_error(exc), silent)
                 break
 
-        archived_on_disk = _archived_rollout_ids()
         reconciled = 0
         for tid in tids:
             try:
-                result = _tidy_one(c, tid, cutoff, a.dry_run, silent, archived_on_disk)
+                result = _tidy_one(c, tid, cutoff, a.dry_run, silent)
                 if result == "archived":
                     archived += 1
                 elif result == "reconciled":
@@ -1607,7 +1808,7 @@ def cmd_tidy(c, a, silent=False, lock=None):
                 append(LOG, {"event": "tidy_failed", "thread": tid, "error": compact_error(exc)})
         if not silent:
             print(f"TIDY archived={archived} reconciled={reconciled} skipped={skipped} failed={failed}")
-        return 0
+        return 1 if failed else 0
     finally:
         if own_lock:
             fcntl.flock(lock, fcntl.LOCK_UN)
@@ -1615,11 +1816,25 @@ def cmd_tidy(c, a, silent=False, lock=None):
 
 
 def cmd_keep(a, keep):
-    records = load_threads()
-    if not isinstance(records, dict) or a.thread not in records:
-        emit(f"FAILED: {a.thread} no está en threads.json; no se modifica ningún hilo")
-        return 5
-    save_thread(a.thread, keep=keep)
+    lock = _thread_lock()
+    try:
+        records = load_threads()
+        if not isinstance(records, dict) or a.thread not in records:
+            emit(f"FAILED: {a.thread} no está en threads.json; no se modifica ningún hilo")
+            return 5
+        if records[a.thread].get("archive_uncertain"):
+            try:
+                _reconcile_archive(Client(), a.thread, records)
+            except (Exception, SystemExit) as exc:
+                emit(f"FAILED: {a.thread} archive incierto: {compact_error(exc)}")
+                return 5
+        if records[a.thread].get("archived_at"):
+            emit(f"FAILED: {a.thread} ya está archivado; keep/unkeep no lo reabre")
+            return 5
+        records[a.thread]["keep"] = keep
+        _write_threads(records)
+    finally:
+        _release_thread_lock(lock)
     emit(f"OK {'keep' if keep else 'unkeep'} {a.thread}")
     return 0
 
@@ -1629,7 +1844,14 @@ def cmd_simple(c, a):
          "archive": ("thread/archive", {"threadId": a.thread}),
          "unarchive": ("thread/unarchive", {"threadId": a.thread}),
          "fork": ("thread/fork", {"threadId": a.thread})}[a.cmd]
-    r = ok(call_held(c, *m), m[0])
+    lock = _thread_lock() if a.cmd == "unarchive" else None
+    try:
+        r = ok(call_held(c, *m), m[0])
+        if a.cmd == "unarchive":
+            _clear_archived_locked(a.thread)
+    finally:
+        if lock is not None:
+            _release_thread_lock(lock)
     new = ((r or {}).get("thread") or {}).get("id")
     if a.cmd == "fork" and new and a.thread in load_threads():
         parent = dict(load_threads()[a.thread])
@@ -1702,7 +1924,17 @@ def cmd_mcp_call(c, a):
 
 
 def cmd_rpc(c, a):
-    print(json.dumps(c.call(a.method, json.loads(a.params or "{}"), timeout=120), indent=1))
+    params = json.loads(a.params or "{}")
+    reopening = a.method == "thread/unarchive" and params.get("threadId")
+    lock = _thread_lock() if reopening else None
+    try:
+        response = c.call(a.method, params, timeout=120)
+        if reopening and "result" in response and "error" not in response:
+            _clear_archived_locked(params["threadId"])
+    finally:
+        if lock is not None:
+            _release_thread_lock(lock)
+    print(json.dumps(response, indent=1))
     return 0
 
 
@@ -2099,7 +2331,11 @@ def main():
     p.add_argument("--from-start", action="store_true")
     p = sub.add_parser("steer"); p.add_argument("thread"); p.add_argument("text")
     p = sub.add_parser("stop"); p.add_argument("thread")
-    p = sub.add_parser("tidy"); p.add_argument("--hours", type=float, default=24); p.add_argument("--dry-run", action="store_true"); p.add_argument("--quiet", action="store_true")
+    p = sub.add_parser("tidy")
+    p.add_argument("--hours", type=float, default=None,
+                   help=f"horas de inactividad (por defecto {DEFAULT_TIDY_HOURS}; entorno {TIDY_HOURS_ENV})")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--quiet", action="store_true")
     p = sub.add_parser("keep"); p.add_argument("thread")
     p = sub.add_parser("unkeep"); p.add_argument("thread")
     p = sub.add_parser("list"); p.add_argument("--limit", type=int, default=25); p.add_argument("--search")
