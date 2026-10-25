@@ -26,10 +26,11 @@ CLAUDE -> CODEX
   bridge.py keep <thread> | unkeep <thread> protect or unprotect a registered thread from tidy
   bridge.py list [--limit N] [--search TEXT] [--archived]
   bridge.py read <thread> [--turns N]
-  bridge.py status <thread>                  held by / running / queue
-  bridge.py finished [--unread] [--owner S] [--hours 24] [--json]
+  bridge.py status <thread> [--json]         writer, queue and normalized thread state
+  bridge.py finished [--unread] [--owner S] [--hours 24] [--json] [--watch]
                                              last turn of each registered thread; SIN LEER = ended
-                                             after the last watch/read (works with the daemon down)
+                                             after the last watch/read; --watch exits on the first
+                                             thread state change (works with the daemon down)
   bridge.py rename <thread> "name" | archive <thread> | unarchive <thread> | fork <thread>
   bridge.py sections | move <thread> <section name or id>
   bridge.py settings <thread> [--model M] [--effort E]
@@ -74,8 +75,10 @@ TOOL = {
     "type": "function", "name": "send_to_claude",
     "description": ("Send a message to the Claude Code session that dispatched this task. Use it for "
                     "meaningful progress, for a question you cannot resolve yourself, and once at the end "
-                    "with the result. Optional `to` names a different Claude session (name or local_ id)."),
-    "inputSchema": {"type": "object", "properties": {"message": {"type": "string"}, "to": {"type": "string"}},
+                    "with the result. Set `wait_for_reply: true` only when blocked pending an answer; set it false "
+                    "for progress and final reports. Optional `to` names a different Claude session (name or local_ id)."),
+    "inputSchema": {"type": "object", "properties": {"message": {"type": "string"}, "to": {"type": "string"},
+                    "wait_for_reply": {"type": "boolean", "description": "true solo si el turno espera respuesta del orquestador"}},
                     "required": ["message"]},
 }
 # An agent fixing a capture glitch can raise its browser window and take over the user's screen.
@@ -189,15 +192,40 @@ def _write_threads(data):
     tmp.replace(THREADS)
 
 
+def save_thread_locked(tid, **kw):
+    """Actualiza el registro cuando el llamador ya posee threads.lock."""
+    d = load_threads()
+    d.setdefault(tid, {}).update(kw)
+    _write_threads(d)
+
+
 def save_thread(tid, **kw):
     lock = _thread_lock()
     try:
-        d = load_threads()
-        d.setdefault(tid, {}).update(kw)
-        _write_threads(d)
+        save_thread_locked(tid, **kw)
     finally:
         fcntl.flock(lock, fcntl.LOCK_UN)
         os.close(lock)
+
+
+def reconcile_queue_entries(tid, consumed_ids):
+    """Retira una sola vez los envíos identificados como consumidos por un turno."""
+    if not consumed_ids:
+        return
+    lock = _thread_lock()
+    try:
+        d = load_threads()
+        record = d.get(tid)
+        if not isinstance(record, dict):
+            return
+        entries = list(record.get("queued_entries") or [])
+        consumed = set(map(str, consumed_ids))
+        remaining = [entry for entry in entries if str(entry.get("id")) not in consumed]
+        entries = remaining
+        record["queued_entries"] = entries
+        _write_threads(d)
+    finally:
+        _release_thread_lock(lock)
 
 
 def mark_consumed(tid, turn_id=None, seen_at=None):
@@ -254,6 +282,9 @@ def recent_rollouts(hours, now_ts):
             path = str(folder / name)
             try:
                 mtime = os.path.getmtime(path)
+            except (FileNotFoundError, NotADirectoryError):
+                # El app mueve rollouts a archived_sessions mientras este barrido enumera.
+                continue
             except OSError:
                 continue
             if now_ts - mtime > hours * 3600:
@@ -273,11 +304,27 @@ def _epoch(stamp):
 TURN_EVENTS = (b'"task_started"', b'"task_complete"', b'"turn_aborted"', b'"task_aborted"')
 
 
-def turn_state(path):
-    """(estado, fin, turno) del último turno del rollout: running | done | aborted | unknown."""
-    state, ended, turn = "unknown", None, None
-    for raw in tail_lines(path, limit=2_000_000):
-        if not any(k in raw for k in TURN_EVENTS):
+def _message_client_id(item):
+    """Identificador de cliente conservado al convertir una entrada de cola en UserMessage."""
+    value = item.get("clientId") or item.get("client_id") or item.get("clientUserMessageId")
+    return str(value) if value else None
+
+
+def turn_details(path, queue_entries=()):
+    """Devuelve el estado y la hora de cambio del último turno real del rollout."""
+    status, ended, turn, changed, input_request = "unknown", None, None, None, False
+    consumed_queue_ids = []
+    pending_entries = list(queue_entries)
+    saw_task_started = False
+    try:
+        lines = tail_lines(path, limit=2_000_000)
+        truncated = os.path.getsize(path) > 2_000_000
+    except (OSError, ValueError):
+        return {"turn_status": "unknown", "ended_at": None, "turn_id": None,
+                "last_changed_at": None, "input_request": None, "consumed_queue_ids": [],
+                "uncertain": True}
+    for raw in lines:
+        if not any(k in raw for k in TURN_EVENTS + (b'"item_completed"',)):
             continue
         try:
             o = json.loads(raw)
@@ -286,12 +333,44 @@ def turn_state(path):
         p = o.get("payload") or {}
         kind = p.get("type")
         if kind == "task_started":
-            state, ended, turn = "running", None, p.get("turn_id")
+            status, ended, turn, changed, input_request = "running", None, p.get("turn_id"), _epoch(o.get("timestamp")), False
+            saw_task_started = True
+        elif kind == "item_completed":
+            item = p.get("item") or {}
+            if item.get("type") in ("UserMessage", "userMessage"):
+                client_id = _message_client_id(item)
+                if client_id:
+                    eligible = next((entry for entry in pending_entries
+                                     if entry.get("client_user_message_id") == client_id), None)
+                    if eligible is not None:
+                        consumed_queue_ids.append(str(eligible.get("id")))
+                        pending_entries.remove(eligible)
+            elif item.get("type") == "DynamicToolCall" and item.get("tool") == "send_to_claude":
+                args = item.get("arguments") or {}
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except ValueError:
+                        args = {}
+                flag = args.get("wait_for_reply")
+                input_request = flag if isinstance(flag, bool) else (False if "wait_for_reply" not in args else None)
         elif kind == "task_complete":
-            state, ended, turn = "done", _epoch(o.get("timestamp")), p.get("turn_id") or turn
+            status, ended, turn = "done", _epoch(o.get("timestamp")), p.get("turn_id") or turn
+            changed = ended
         elif kind in ("turn_aborted", "task_aborted"):
-            state, ended, turn = "aborted", _epoch(o.get("timestamp")), p.get("turn_id") or turn
-    return state, ended, turn
+            status, ended, turn = "aborted", _epoch(o.get("timestamp")), p.get("turn_id") or turn
+            changed = ended
+    uncertain = bool(truncated and status == "done" and not saw_task_started)
+    return {"turn_status": status, "ended_at": ended, "turn_id": turn,
+            "last_changed_at": changed, "input_request": input_request,
+            "consumed_queue_ids": consumed_queue_ids,
+            "uncertain": uncertain}
+
+
+def turn_state(path):
+    """Compatibilidad: (estado, fin, turno) del último turno del rollout."""
+    details = turn_details(path)
+    return details["turn_status"], details["ended_at"], details["turn_id"]
 
 
 def is_unread(state, ended, turn, meta):
@@ -302,6 +381,87 @@ def is_unread(state, ended, turn, meta):
     if turn and consumed_turn:
         return str(turn) > str(consumed_turn)
     return ended > (meta.get("consumed_at") or 0)
+
+
+def _state_label(details, meta, queued=None):
+    legacy_queue_pending = bool(meta.get("queued_at") and meta.get("queued_count"))
+    queue_pending = (bool(meta.get("queued_entries")) or legacy_queue_pending) if queued is None else bool(queued)
+    if details.get("uncertain") or queue_pending or details["turn_status"] in ("running", "unknown"):
+        return "running"
+    if not details.get("last_changed_at"):
+        return "running"
+    if details["turn_status"] == "aborted":
+        return "failed"
+    if details["turn_status"] == "done":
+        if details["input_request"] is None:
+            return "running"
+        if details["input_request"]:
+            return "waiting_input"
+        return "done_unread" if is_unread("done", details["ended_at"], details["turn_id"], meta) else "done_read"
+    return "running"
+
+
+def _api_turn_details(thread, queue_entries=()):
+    turns = thread.get("turns") or []
+    turn = turns[-1] if turns else {}
+    raw_status = str(turn.get("status", "")).lower()
+    mapped = {"inprogress": "running", "in_progress": "running", "running": "running",
+              "started": "running", "failed": "aborted", "aborted": "aborted",
+              "interrupted": "aborted",
+              "cancelled": "aborted", "canceled": "aborted"}.get(raw_status)
+    if mapped is None:
+        mapped = "done" if raw_status in ("completed", "complete", "done") else "unknown"
+    input_request = False
+    consumed = []
+    pending_entries = list(queue_entries)
+    for item in turn.get("items", []):
+        item_type = item.get("type")
+        if item_type in ("UserMessage", "userMessage"):
+            client_id = _message_client_id(item)
+            if client_id:
+                eligible = next((entry for entry in pending_entries
+                                 if entry.get("client_user_message_id") == client_id), None)
+                if eligible is not None:
+                    consumed.append(str(eligible.get("id")))
+                    pending_entries.remove(eligible)
+        elif item_type in ("DynamicToolCall", "dynamicToolCall") and item.get("tool") == "send_to_claude":
+            args = item.get("arguments") or {}
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except ValueError:
+                    args = {}
+            flag = args.get("wait_for_reply")
+            input_request = flag if isinstance(flag, bool) else (False if "wait_for_reply" not in args else None)
+    transition_key = "startedAt" if mapped == "running" else "completedAt"
+    changed = _timestamp(turn.get(transition_key))
+    return {"turn_status": mapped, "turn_id": turn.get("id"), "ended_at": changed if mapped != "running" else None,
+            "last_changed_at": changed, "input_request": input_request,
+            "consumed_queue_ids": consumed,
+            "uncertain": False}, raw_status
+
+
+def _snapshot_signature(thread):
+    turns = thread.get("turns") or []
+    if not turns:
+        return None
+    last = turns[-1]
+    return (last.get("id"), last.get("status"), last.get("updatedAt"), last.get("completedAt"))
+
+
+def _queued_ids(rows):
+    ids = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        submission = row.get("queuedSubmission") or row
+        identifier = submission.get("id") or submission.get("queuedSubmissionId")
+        ids.append(str(identifier) if identifier is not None else json.dumps(row, sort_keys=True))
+    return ids
+
+
+def _iso_time(value):
+    return datetime.fromtimestamp(value, timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z") if value else None
 
 
 def finished_threads(hours=24, owner=None, now_ts=None):
@@ -315,18 +475,60 @@ def finished_threads(hours=24, owner=None, now_ts=None):
         if owner and meta.get("from") != owner:
             continue
         path = rollouts.get(tid)
-        if not path or now_ts - os.path.getmtime(path) > hours * 3600:
+        if not path:
             continue
-        state, ended, turn = turn_state(path)
+        try:
+            activity = os.path.getmtime(path)
+        except OSError:
+            activity = None
+        if activity is not None and now_ts - activity > hours * 3600:
+            continue
+        entries = meta.get("queued_entries") or []
+        details = turn_details(path, entries)
+        if details["uncertain"]:
+            refreshed = recent_rollouts(hours, now_ts).get(tid)
+            if refreshed and refreshed != path:
+                path = refreshed
+                details = turn_details(path, entries)
+                try:
+                    activity = os.path.getmtime(path)
+                except OSError:
+                    activity = None
+        if details["consumed_queue_ids"]:
+            reconcile_queue_entries(tid, details["consumed_queue_ids"])
+            meta = load_threads().get(tid, meta)
+        state = _state_label(details, meta)
+        queue_times = [_timestamp(q.get("queued_at")) for q in meta.get("queued_entries", [])]
+        queue_times = [stamp for stamp in queue_times if stamp is not None]
+        changed_at = max([stamp for stamp in (details["last_changed_at"], *(queue_times if state == "running" else ())) if stamp is not None],
+                         default=None)
+        unread = ((state == "waiting_input" and is_unread("done", details["ended_at"], details["turn_id"], meta)) or
+                  state == "done_unread" or
+                  (state == "failed" and is_unread("aborted", details["ended_at"], details["turn_id"], meta)))
         rows.append({"thread": tid, "title": meta.get("title"), "agent": meta.get("agent"),
                      "from": meta.get("from"), "role": meta.get("role"), "state": state,
-                     "ended_at": ended, "activity_at": os.path.getmtime(path),
-                     "unread": is_unread(state, ended, turn, meta)})
+                     "last_changed_at": _iso_time(changed_at),
+                     "last_changed_epoch": changed_at,
+                     "turn_id": details["turn_id"], "ended_at": details["ended_at"],
+                     "activity_at": activity or 0,
+                     "unread": unread, "uncertain": details["uncertain"]})
     return sorted(rows, key=lambda r: r["activity_at"])
 
 
 def cmd_finished(a):
     rows = finished_threads(a.hours, a.owner)
+    if getattr(a, "watch", False):
+        baseline = {r["thread"]: (r["state"], r.get("last_changed_at"), r.get("turn_id")) for r in rows}
+        while True:
+            time.sleep(getattr(a, "interval", 0.5))
+            current = finished_threads(a.hours, a.owner)
+            changed = [r for r in current if not r.get("uncertain") and (r["thread"] not in baseline or
+                       baseline[r["thread"]] != (r["state"], r.get("last_changed_at"), r.get("turn_id")))]
+            if a.unread:
+                changed = [r for r in changed if r["unread"]]
+            if changed:
+                rows = changed
+                break
     if a.unread:
         rows = [r for r in rows if r["unread"]]
     if a.json:
@@ -1331,11 +1533,39 @@ def cmd_send(c, a):
                     lock = None
                     return 0 if a.no_watch else watch(a.thread, a.timeout, path=path, offset=off, turn_id=turn)
                 emit(f"WARN: app route failed ({(r or {}).get('error', {}).get('message')}); queueing instead")
-            r = ok(c.call("thread/queue/add", {"threadId": a.thread, "clientUserMessageId": str(uuid.uuid4()),
-                                               "input": [{"type": "text", "text": a.prompt}]}), "thread/queue/add")
+            meta = load_threads().get(a.thread, {})
+            client_message_id = str(uuid.uuid4())
+            intent_at = time.time()
+            intent = {"id": f"client:{client_message_id}",
+                      "client_user_message_id": client_message_id, "status": "pending",
+                      "queued_at": intent_at}
+            entries = list(meta.get("queued_entries") or []) + [intent]
+            save_thread_locked(a.thread, queued_entries=entries, queued_updated_at=intent_at)
+            response = c.call("thread/queue/add", {"threadId": a.thread, "clientUserMessageId": client_message_id,
+                                                    "input": [{"type": "text", "text": a.prompt}]})
+            error = response.get("error") if isinstance(response, dict) else None
+            # Un código JSON-RPC confirma el rechazo; un error de transporte puede
+            # llegar después de que el servidor haya aceptado y debe conservar la intención.
+            if isinstance(error, dict) and isinstance(error.get("code"), int):
+                current = load_threads().get(a.thread, {})
+                remaining = [entry for entry in current.get("queued_entries", [])
+                             if entry.get("client_user_message_id") != client_message_id]
+                save_thread_locked(a.thread, queued_entries=remaining)
+            r = ok(response, "thread/queue/add")
             emit(f"QUEUED {now()} {r['queuedSubmission'].get('id')}: the ChatGPT app holds this thread; "
                  "it checks its queue about every 10 s and then starts the turn")
             append(LOG, {"event": "queued", "thread": a.thread})
+            meta = load_threads().get(a.thread, {})
+            submission = r.get("queuedSubmission") or {}
+            accepted_client_id = submission.get("clientUserMessageId") or submission.get("client_user_message_id")
+            if accepted_client_id and accepted_client_id != client_message_id:
+                raise RuntimeError("thread/queue/add devolvió otro clientUserMessageId; se conserva la intención pendiente")
+            submission_id = submission.get("id")
+            entries = list(meta.get("queued_entries") or [])
+            entry = next((q for q in entries if q.get("client_user_message_id") == client_message_id), intent)
+            entry.update({"id": str(submission_id or entry["id"]), "status": "accepted"})
+            save_thread_locked(a.thread, queued_entries=entries, queued_updated_at=entry["queued_at"],
+                               )
             _release_thread_lock(lock)
             lock = None
             return 0 if a.no_watch else watch(a.thread, a.timeout, path=path, offset=off, match_text=a.prompt)
@@ -1522,6 +1752,64 @@ def writer_name(pid):
 
 def cmd_status(c, a):
     who = writer_name(lock_holder(a.thread))
+    if getattr(a, "json", False):
+        def emit_uncertain(error):
+            print(json.dumps({"thread": a.thread, "state": "running", "last_changed_at": None,
+                              "turn_id": None, "turn_status": "unknown", "queued": None,
+                              "unread": False, "writer": who, "error": compact_error(error)},
+                             ensure_ascii=False))
+            return 0
+
+        params = {"threadId": a.thread, "includeTurns": True}
+        first = c.call("thread/read", params)
+        if "error" in first:
+            return emit_uncertain(first["error"])
+        first_thread = (first.get("result") or {}).get("thread")
+        q1 = c.call("thread/queue/list", {"threadId": a.thread})
+        if "error" in q1 or not isinstance(first_thread, dict):
+            return emit_uncertain((q1.get("error") if "error" in q1 else "thread/read sin hilo"))
+        queued1 = (q1.get("result") or {}).get("data")
+        if not isinstance(queued1, list):
+            return emit_uncertain("thread/queue/list sin datos")
+        second = c.call("thread/read", params)
+        if "error" in second:
+            return emit_uncertain(second["error"])
+        second_thread = (second.get("result") or {}).get("thread")
+        q2 = c.call("thread/queue/list", {"threadId": a.thread})
+        if "error" in q2 or not isinstance(second_thread, dict):
+            return emit_uncertain((q2.get("error") if "error" in q2 else "thread/read sin hilo"))
+        queued2 = (q2.get("result") or {}).get("data")
+        if not isinstance(queued2, list):
+            return emit_uncertain("thread/queue/list sin datos")
+        ids1, ids2 = sorted(_queued_ids(queued1)), sorted(_queued_ids(queued2))
+        stable = _snapshot_signature(first_thread) == _snapshot_signature(second_thread) and ids1 == ids2
+        meta = load_threads().get(a.thread, {})
+        details, raw_status = _api_turn_details(second_thread, meta.get("queued_entries", []))
+        if stable:
+            reconcile_queue_entries(a.thread, details["consumed_queue_ids"])
+            meta = load_threads().get(a.thread, meta)
+        legacy_queue_pending = bool(meta.get("queued_at") and meta.get("queued_count"))
+        queue_pending = bool(queued2) or bool(meta.get("queued_entries")) or legacy_queue_pending
+        state = _state_label(details, meta, queue_pending) if stable else "running"
+        changed = details["last_changed_at"]
+        if queue_pending:
+            queue_times = [_timestamp(item.get("queuedAt") or item.get("createdAt"))
+                           for item in queued2 if isinstance(item, dict)]
+            queue_times.extend(_timestamp(item.get("queued_at")) for item in meta.get("queued_entries", []))
+            if legacy_queue_pending:
+                queue_times.append(_timestamp(meta.get("queued_at")))
+            queue_times = [stamp for stamp in queue_times if stamp is not None]
+            if meta.get("queued_updated_at"):
+                queue_times.append(meta["queued_updated_at"])
+            changed = max([stamp for stamp in (changed, *queue_times) if stamp is not None], default=None)
+        unread = (state == "done_unread" or
+                  (state == "waiting_input" and is_unread("done", details["ended_at"], details["turn_id"], meta)) or
+                  (state == "failed" and is_unread("aborted", details["ended_at"], details["turn_id"], meta)))
+        last_turn = ((second_thread.get("turns") or [])[-1] if second_thread.get("turns") else {})
+        print(json.dumps({"thread": a.thread, "state": state, "last_changed_at": _iso_time(changed),
+                          "turn_id": last_turn.get("id"), "turn_status": raw_status or None,
+                          "queued": len(queued2), "unread": unread, "writer": who}, ensure_ascii=False))
+        return 0
     r = ok(c.call("thread/read", {"threadId": a.thread, "includeTurns": True}), "thread/read")
     turns = r["thread"].get("turns") or []
     q = c.call("thread/queue/list", {"threadId": a.thread}).get("result", {}).get("data", [])
@@ -1880,6 +2168,15 @@ def cmd_settings(c, a):
 def cmd_queue(c, a):
     if a.delete:
         ok(c.call("thread/queue/delete", {"threadId": a.thread, "queuedSubmissionId": a.delete}), "thread/queue/delete")
+        lock = _thread_lock()
+        try:
+            records = load_threads()
+            meta = records.get(a.thread)
+            if isinstance(meta, dict):
+                meta["queued_entries"] = [q for q in meta.get("queued_entries", []) if q.get("id") != a.delete]
+                _write_threads(records)
+        finally:
+            _release_thread_lock(lock)
         emit(f"OK deleted {a.delete}")
         return 0
     for q in ok(c.call("thread/queue/list", {"threadId": a.thread}), "thread/queue/list").get("data", []):
@@ -2345,7 +2642,7 @@ def main():
     p = sub.add_parser("list"); p.add_argument("--limit", type=int, default=25); p.add_argument("--search")
     p.add_argument("--archived", action="store_true")
     p = sub.add_parser("read"); p.add_argument("thread"); p.add_argument("--turns", type=int, default=2)
-    p = sub.add_parser("status"); p.add_argument("thread")
+    p = sub.add_parser("status"); p.add_argument("thread"); p.add_argument("--json", action="store_true")
     p = sub.add_parser("rename"); p.add_argument("thread"); p.add_argument("name")
     for n in ("archive", "unarchive", "fork"):
         sub.add_parser(n).add_argument("thread")
@@ -2371,6 +2668,8 @@ def main():
     p = sub.add_parser("claude-started"); p.add_argument("--last", type=int, default=None)
     p = sub.add_parser("finished"); p.add_argument("--hours", type=float, default=24)
     p.add_argument("--owner"); p.add_argument("--unread", action="store_true"); p.add_argument("--json", action="store_true")
+    p.add_argument("--watch", action="store_true", help="espera hasta que cambie el estado de cualquier hilo")
+    p.add_argument("--interval", type=float, default=0.5, help=argparse.SUPPRESS)
     p = sub.add_parser("claude-read"); p.add_argument("session"); p.add_argument("--last", type=int, default=4)
     for n in ("serve", "up", "ping"):
         sub.add_parser(n)

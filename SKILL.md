@@ -46,14 +46,24 @@ La conciliación contrasta `thread/read` con los rollouts de `archived_sessions`
 | Seguir un turno | `/usr/bin/python3 $B watch <thread>`: sigue el turno actual, imprime `WAITING` y continúa con el siguiente si hay un mensaje en cola; si no, `IDLE` con la última respuesta. `--from-start` repite el último turno |
 | Añadir texto a un turno / detenerlo | `steer <thread> "text"` / `stop <thread>`: para hilos gestionados por este bridge y, mediante la aplicación, para hilos abiertos allí |
 | Entrega inmediata a hilos de la aplicación | `/usr/bin/python3 $B app-connect`: una vez por lanzamiento de ChatGPT; después los verbos para hilos abiertos pasan por la aplicación |
-| Buscar y leer | `list [--search T] [--archived]`, `read <thread> [--turns N]`, `status <thread>` (escritor, último turno, cola) |
-| Hilos terminados sin leer | `/usr/bin/python3 $B finished --unread [--owner <sessionId>] [--json]`: último turno de cada hilo registrado; `SIN LEER` si acabó después del último `watch`/`read`. No usa el daemon |
+| Buscar y leer | `list [--search T] [--archived]`, `read <thread> [--turns N]`, `status <thread> [--json]` (escritor, turno, cola y estado) |
+| Estado de hilos | `/usr/bin/python3 $B finished [--unread] [--owner <sessionId>] [--json]`: estado del último turno real de cada hilo registrado. No usa el daemon |
 | Gestionar | `rename`, `fork`, `archive`, `unarchive`, `sections`, `move <thread> <section>`, `settings <thread> --model M --effort E`, `goal <thread> ["objective"] [--clear]`, `queue <thread> [--delete ID]` |
 | Herramientas MCP de Codex | `mcp [server]` lista las herramientas; `mcp-call <server> <tool> '{args}' [--thread T]` llama una sin turno de agente |
 | Cualquier otro método | `rpc <method> '{params}'`: todos los métodos del app-server |
 | Comprobar una actualización | `/usr/bin/python3 $B doctor [--verbose]`: read-only; informa `{ok, missing, codex_version, daemon}` y no inicia daemon ni turno |
 
 Desde `start`, las respuestas vuelven a esta sesión (`--from` toma por defecto su identificador: `CLAUDE_CODE_HOST_SESSION_ID` o, si falta, `CLAUDE_CODE_SESSION_ID`; `--agent` o `CLAUDE_CODEX_BRIDGE_AGENT` guarda el subagente que espera). `watch` y `read` anotan en `threads.json` cuándo se leyó el final del turno. Los nuevos hilos aparecen en la barra lateral de ChatGPT en su refresco de un minuto. Usa el enlace `codex://threads/<id>` de la línea `THREAD`.
+
+El estado es único por hilo: `running`, `done_unread`, `done_read`, `failed` o `waiting_input`. Incluye `last_changed_at` (UTC, ISO 8601), que solo cambia al cambiar el estado o el turno, y el id del último turno. Un turno activo o un envío registrado en cola mantiene el hilo como `running`; así un final anterior no despierta al vigilante. El bridge registra `clientUserMessageId` antes de `thread/queue/add` y retira el envío solo al encontrar el mismo `clientId` en el `UserMessage` del turno. Nunca infieras consumo por texto o fecha. Los registros antiguos de cola sin ese ID se conservan en `running` hasta que se eliminen explícitamente. En `send_to_claude`, usa `wait_for_reply: true` solo si el turno debe esperar respuesta; usa `false` en avances y resultados finales. Por compatibilidad, un turno completado en un hilo antiguo sin esa bandera cuenta como final. Si falta evidencia fiable porque el rollout está truncado, el estado queda `running`.
+
+Para esperar a que cambie cualquiera de tus hilos, deja un único proceso esperando:
+
+```bash
+/usr/bin/python3 $B finished --watch --owner <sessionId> --json
+```
+
+El comando compara los estados iniciales, espera internamente y termina al detectar el primer hilo nuevo o cambiado, emitiendo su fila JSON. Usa `finished --watch --json` para vigilar todos los hilos registrados. Esto sustituye el bucle de sondeo externo. `status <thread> --json` devuelve el mismo estado y hora para un hilo concreto.
 
 Líneas del stream: `THREAD`, `SENT`, `QUEUED`, `WAITING`, `STARTED`, `AGENT:` (texto del agente), `CODEX:` (el agente llamó a `send_to_claude`), `DONE <time>: <final answer>`, `FAILED`, `TIMEOUT` (sigue ejecutándose; vuelve a usar `watch`). Un `watch` termina por sí solo si ningún proceso ha tenido el hilo durante 30 s. Para respuestas largas, ejecuta `read <thread> --turns 1` después de `DONE`.
 
