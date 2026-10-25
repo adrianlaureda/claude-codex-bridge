@@ -985,8 +985,12 @@ class Client:
 
     def call(self, method, params=None, timeout=60):
         params = dict(params or {})
+        # El reloj monotónico es propio de cada proceso en macOS: al daemon solo
+        # viaja el margen restante, nunca un instante absoluto de este proceso.
+        deadline = params.pop("_deadline", None)
+        if deadline is not None:
+            timeout = min(timeout, _remaining(deadline))
         params["_timeout"] = timeout
-        params["_deadline"] = min(params.get("_deadline", float("inf")), time.monotonic() + timeout)
         self.c.settimeout(timeout + 15)  # a stuck daemon never hangs the command
         try:
             self.c.sendall((json.dumps({"method": method, "params": params}) + "\n").encode())

@@ -878,15 +878,28 @@ class TidyTests(unittest.TestCase):
         self.assertEqual(self.archived_ids(backend), [])
         self.assertNotIn("archived_at", bridge.load_threads()["old"])
 
-    def test_client_transmits_absolute_deadline(self):
+    def test_client_transmits_only_relative_timeout(self):
         client = object.__new__(bridge.Client)
         client.c = Mock()
         client.f = Mock()
         client.f.readline.return_value = '{"result": {}}\n'
         with patch.object(bridge.time, "monotonic", return_value=100.0):
-            client.call("bridge/tidy-archive", {"threadId": "old"}, timeout=10)
-        request = json.loads(client.c.sendall.call_args.args[0])
-        self.assertEqual(request["params"]["_deadline"], 110.0)
+            client.call("bridge/tidy-archive", {"threadId": "old", "_deadline": 104.0}, timeout=10)
+            client.call("thread/search", {}, timeout=10)
+        first, second = (json.loads(c.args[0]) for c in client.c.sendall.call_args_list)
+        self.assertNotIn("_deadline", first["params"])
+        self.assertEqual(first["params"]["_timeout"], 4.0)
+        self.assertNotIn("_deadline", second["params"])
+        self.assertEqual(second["params"]["_timeout"], 10)
+
+    def test_daemon_accepts_client_from_another_monotonic_clock(self):
+        # Un cliente recién arrancado tiene un reloj cerca de cero; el daemon, horas.
+        d = object.__new__(bridge.Daemon)
+        d.running = {}
+        d.workers = {}
+        with patch.object(bridge.time, "monotonic", return_value=50_000.0):
+            r = d.rpc("bridge/ping", {"_timeout": 10})
+        self.assertIn("result", r)
 
     def test_registry_lock_wait_respects_deadline(self):
         lock = bridge._thread_lock()
