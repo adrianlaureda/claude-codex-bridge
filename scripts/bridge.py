@@ -15,14 +15,21 @@ which the app runs itself. `watch` reads the thread's rollout file, which Codex
 writes for every thread, so it streams app-held threads too.
 
 CLAUDE -> CODEX
-  bridge.py start "prompt" [--title T] [--cwd D] [--model M] [--effort E] [--from local_<id>] [--no-watch]
+  bridge.py start "prompt" --role ROLE --cwd D [--title T] [--from S] [--agent NAME] [--no-watch]
+                     [--sandbox {workspace-write,read-only} | --full-access] [--no-network]
   bridge.py send <thread> "prompt" [--model M] [--effort E] [--no-watch]   unheld: new turn; held: queued
   bridge.py watch <thread> [--timeout S] [--from-start]   stream until the current turn ends
   bridge.py steer <thread> "text"            add input to the running turn (bridge-held threads)
   bridge.py stop <thread>                    interrupt the running turn (bridge-held threads)
+  bridge.py tidy [--hours 8] [--dry-run] [--quiet]
+                                             archive old registered, idle bridge threads
+  bridge.py keep <thread> | unkeep <thread> protect or unprotect a registered thread from tidy
   bridge.py list [--limit N] [--search TEXT] [--archived]
   bridge.py read <thread> [--turns N]
   bridge.py status <thread>                  held by / running / queue
+  bridge.py finished [--unread] [--owner S] [--hours 24] [--json]
+                                             last turn of each registered thread; SIN LEER = ended
+                                             after the last watch/read (works with the daemon down)
   bridge.py rename <thread> "name" | archive <thread> | unarchive <thread> | fork <thread>
   bridge.py sections | move <thread> <section name or id>
   bridge.py settings <thread> [--model M] [--effort E]
@@ -36,16 +43,17 @@ CODEX -> CLAUDE
   bridge.py to-claude --to <name|local_id> "message" [--thread T]
   bridge.py relay [--minutes 55]             run by a Claude session under Monitor; prints each
                                              inbox message as one line to deliver with SendMessage
-  bridge.py claude-start "prompt" [--cwd D]  start a background Claude Code session (claude --bg);
-                                             continue it: claude --bg --resume <id> "msg"; stop: claude stop <id>
+  bridge.py claude-start "prompt" [--cwd D] [--name N] [--no-remote-control]
+                                             start a visible background Claude Code session and record its URL
+  bridge.py claude-started [--last N]          list recorded sessions with their current status
   bridge.py claude-read <local_id|name|sessionId> [--last N]   recent messages from its transcript
 
 DAEMON
   bridge.py up | down | ping
 """
-import argparse, fcntl, glob, json, os, queue, socket, socketserver, subprocess, sys, threading, time, uuid
+import argparse, fcntl, glob, json, math, os, queue, re, socket, socketserver, subprocess, sys, threading, time, uuid
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 CODEX = os.environ.get("CODEX_BIN",
@@ -56,7 +64,11 @@ INBOX = HOME / "inbox.jsonl"
 THREADS = HOME / "threads.json"
 LOG = HOME / "events.jsonl"
 SESSIONS = Path.home() / ".codex" / "sessions"
+ARCHIVED_SESSIONS = Path.home() / ".codex" / "archived_sessions"
 LOCKED = "already has an active writer"
+DEFAULT_TIDY_HOURS = 8
+TIDY_HOURS_ENV = "CLAUDE_CODEX_BRIDGE_TIDY_HOURS"
+TIDY_INTERVAL_SECONDS = 3600
 
 TOOL = {
     "type": "function", "name": "send_to_claude",
@@ -82,11 +94,32 @@ INSTRUCTIONS = ("This task was dispatched by a Claude Code session, not typed by
                 "send_to_claude instead. Every time you tell the user about a thread or session, give its "
                 "clickable link: a Claude Code session as claude://claude.ai/epitaxy/<local_id>, a Codex "
                 "thread as codex://threads/<id>. Stop and ask with send_to_claude before accepting new "
-                "terms, paying, or granting account access (OAuth).")
+                "terms, paying, or granting account access (OAuth). Without explicit authorization in the "
+                "task text, do not commit, push, merge, deploy, delete, install, change credentials, or "
+                "message families or students, and do not write to Abalar, XADE, or Moodle. Keep student "
+                "data inside the approved circuit and never put it in logs, commits, or published artifacts. "
+                "No datos de alumnado fuera del circuito aprobado ni en logs, commits o artefactos publicados.")
 
 
 def now():
     return datetime.now().strftime("%H:%M:%S")
+
+
+def tidy_hours(value=None):
+    """Devuelve el umbral de limpieza; la opción explícita prevalece sobre el entorno."""
+    raw = value if value is not None else os.environ.get(TIDY_HOURS_ENV, DEFAULT_TIDY_HOURS)
+    try:
+        hours = float(raw)
+    except (TypeError, ValueError):
+        hours = float(DEFAULT_TIDY_HOURS)
+    if not math.isfinite(hours):
+        hours = float(DEFAULT_TIDY_HOURS)
+    return max(0, hours)
+
+
+def tidy_hours_arg(value=None):
+    """Formatea el umbral para una invocación hija sin perder decimales válidos."""
+    return f"{tidy_hours(value):g}"
 
 
 def emit(line):
@@ -123,16 +156,275 @@ def load_threads():
         return {}
 
 
-def save_thread(tid, **kw):
-    d = load_threads()
-    d.setdefault(tid, {}).update(kw)
+def _remaining(deadline):
+    remaining = deadline - time.monotonic()
+    if not math.isfinite(remaining) or remaining <= 0:
+        raise TimeoutError("petición vencida; no se inicia ninguna operación")
+    return remaining
+
+
+def _thread_lock(deadline=None):
     HOME.mkdir(parents=True, exist_ok=True)
+    fd = os.open(HOME / "threads.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        if deadline is None:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        else:
+            while True:
+                _remaining(deadline)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    time.sleep(min(0.01, _remaining(deadline)))
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _write_threads(data):
     tmp = THREADS.with_suffix(f".{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(d, indent=1))
+    tmp.write_text(json.dumps(data, indent=1))
     tmp.replace(THREADS)
 
 
+def save_thread(tid, **kw):
+    lock = _thread_lock()
+    try:
+        d = load_threads()
+        d.setdefault(tid, {}).update(kw)
+        _write_threads(d)
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        os.close(lock)
+
+
+def mark_consumed(tid, turn_id=None, seen_at=None):
+    """Anota qué final de turno se leyó, para que `finished` no lo dé por pendiente.
+
+    Se guarda el turno observado (`consumed_turn`) y la hora de la observación (`seen_at`,
+    tomada antes de leer), no la de esta escritura: un turno que termine entre la lectura y
+    la marca sigue pendiente. La marca solo avanza (ids UUIDv7, ordenados por tiempo).
+    Solo hilos registrados: un hilo ajeno al bridge no entra en threads.json por leerlo."""
+    seen_at = seen_at if seen_at is not None else time.time()
+    try:
+        lock = _thread_lock()
+    except OSError:
+        return  # sin marca el vigilante avisa de más, nunca de menos
+    try:
+        d = load_threads()
+        meta = d.get(tid)
+        if meta is None:
+            return
+        if turn_id and str(turn_id) >= str(meta.get("consumed_turn") or ""):
+            meta["consumed_turn"] = str(turn_id)
+        meta["consumed_at"] = max(seen_at, meta.get("consumed_at") or 0)
+        _write_threads(d)
+    except OSError:
+        pass
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        os.close(lock)
+
+
+ROLLOUT_ID = re.compile(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:_\d+)?\.jsonl(?:\.zst)?$")
+ROLLOUT_NAME = re.compile(r"rollout-.*?([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:_\d+)?\.jsonl$")
+
+
+def recent_rollouts(hours, now_ts):
+    """{hilo: rollout más reciente} mirando solo las carpetas de día recientes, sin el daemon.
+
+    `finished` lo llama un vigilante cada pocos minutos: recorrer todo ~/.codex/sessions sería caro."""
+    found = {}
+    days = int(hours // 24) + 2
+    folders = [SESSIONS / f"{d:%Y}" / f"{d:%m}" / f"{d:%d}"
+               for d in (datetime.fromtimestamp(now_ts - back * 86400) for back in range(days))]
+    # Un hilo archivado mueve su rollout a archived_sessions (plano); los .zst antiguos no casan.
+    folders.append(ARCHIVED_SESSIONS)
+    for folder in folders:
+        try:
+            names = os.listdir(folder)
+        except OSError:
+            continue
+        for name in names:
+            m = ROLLOUT_NAME.match(name)
+            if not m:
+                continue
+            path = str(folder / name)
+            try:
+                mtime = os.path.getmtime(path)
+            except OSError:
+                continue
+            if now_ts - mtime > hours * 3600:
+                continue
+            if m.group(1) not in found or mtime > found[m.group(1)][1]:
+                found[m.group(1)] = (path, mtime)
+    return {tid: path for tid, (path, _) in found.items()}
+
+
+def _epoch(stamp):
+    try:
+        return datetime.fromisoformat(str(stamp).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+TURN_EVENTS = (b'"task_started"', b'"task_complete"', b'"turn_aborted"', b'"task_aborted"')
+
+
+def turn_state(path):
+    """(estado, fin, turno) del último turno del rollout: running | done | aborted | unknown."""
+    state, ended, turn = "unknown", None, None
+    for raw in tail_lines(path, limit=2_000_000):
+        if not any(k in raw for k in TURN_EVENTS):
+            continue
+        try:
+            o = json.loads(raw)
+        except ValueError:
+            continue
+        p = o.get("payload") or {}
+        kind = p.get("type")
+        if kind == "task_started":
+            state, ended, turn = "running", None, p.get("turn_id")
+        elif kind == "task_complete":
+            state, ended, turn = "done", _epoch(o.get("timestamp")), p.get("turn_id") or turn
+        elif kind in ("turn_aborted", "task_aborted"):
+            state, ended, turn = "aborted", _epoch(o.get("timestamp")), p.get("turn_id") or turn
+    return state, ended, turn
+
+
+def is_unread(state, ended, turn, meta):
+    """Pendiente si el último turno acabó y no es el que se leyó (o, sin id, acabó tras la lectura)."""
+    if state not in ("done", "aborted") or not ended:
+        return False
+    consumed_turn = meta.get("consumed_turn")
+    if turn and consumed_turn:
+        return str(turn) > str(consumed_turn)
+    return ended > (meta.get("consumed_at") or 0)
+
+
+def finished_threads(hours=24, owner=None, now_ts=None):
+    """Hilos registrados con actividad en las últimas `hours` horas y el estado de su último turno.
+
+    `unread` es True cuando el turno terminó después de la última lectura (watch/read)."""
+    now_ts = now_ts or time.time()
+    rollouts = recent_rollouts(hours, now_ts)
+    rows = []
+    for tid, meta in load_threads().items():
+        if owner and meta.get("from") != owner:
+            continue
+        path = rollouts.get(tid)
+        if not path or now_ts - os.path.getmtime(path) > hours * 3600:
+            continue
+        state, ended, turn = turn_state(path)
+        rows.append({"thread": tid, "title": meta.get("title"), "agent": meta.get("agent"),
+                     "from": meta.get("from"), "role": meta.get("role"), "state": state,
+                     "ended_at": ended, "activity_at": os.path.getmtime(path),
+                     "unread": is_unread(state, ended, turn, meta)})
+    return sorted(rows, key=lambda r: r["activity_at"])
+
+
+def cmd_finished(a):
+    rows = finished_threads(a.hours, a.owner)
+    if a.unread:
+        rows = [r for r in rows if r["unread"]]
+    if a.json:
+        print(json.dumps(rows, ensure_ascii=False))
+        return 0
+    for r in rows:
+        mark = "SIN LEER" if r["unread"] else ""
+        print(f"{r['state']:<8} {mark:<8} {(r['agent'] or '-')[:20]:<20} {(r['title'] or '-')[:40]:<40} {r['thread']}")
+    return 0
+
+
+def normalize_cwd(value):
+    """Devuelve un directorio existente, absoluto y normalizado."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("--cwd debe ser un directorio existente no vacío")
+    try:
+        cwd = Path(value).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise ValueError(f"--cwd no es un directorio existente: {value!r}") from exc
+    if not cwd.is_dir():
+        raise ValueError(f"--cwd no es un directorio existente: {value!r}")
+    return cwd
+
+
+def route_model(role):
+    """Resuelve provider, modelo y esfuerzo mediante el router canónico, sin fallback."""
+    command = ["uv", "run", "python3", str(Path.home() / ".dotfiles/ai/scripts/model-routing.py"),
+               "--role", role, "--format", "json"]
+    try:
+        result = subprocess.run(command, cwd=Path.home() / ".dotfiles/ai", stdin=subprocess.DEVNULL,
+                                capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ValueError(f"fallo del router canónico: {exc}") from exc
+    if result.returncode:
+        detail = (result.stderr or result.stdout or "sin detalle").strip()
+        raise ValueError(f"fallo del router canónico: {detail[:300]}")
+    try:
+        routed = json.loads(result.stdout)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("el router canónico devolvió JSON inválido") from exc
+    if not isinstance(routed, dict):
+        raise ValueError("el router canónico no devolvió un objeto JSON")
+    if routed.get("provider") != "openai":
+        raise ValueError(f"proveedor del router no permitido: {routed.get('provider')!r}")
+    model, effort = routed.get("model"), routed.get("effort")
+    if not isinstance(model, str) or not model.strip():
+        raise ValueError("el router canónico no devolvió un modelo válido")
+    if not isinstance(effort, str) or not effort.strip():
+        raise ValueError("el router canónico no devolvió un esfuerzo válido")
+    return {"provider": "openai", "model": model.strip(), "effort": effort.strip()}
+
+
+def execution_policy(cwd, sandbox=None, full_access=False, no_network=False):
+    """Construye las formas de sandbox aceptadas por thread/start y turn/start."""
+    if full_access and no_network:
+        raise ValueError("--no-network no es compatible con --full-access")
+    if full_access:
+        mode = "danger-full-access"
+    else:
+        mode = sandbox or "workspace-write"
+    if mode == "workspace-write":
+        network_access = not no_network
+        return mode, network_access, {"sandbox_workspace_write.network_access": network_access}, {
+            "type": "workspaceWrite", "networkAccess": network_access, "writableRoots": [str(cwd)]
+        }
+    if mode == "read-only":
+        return mode, False, {}, {"type": "readOnly", "networkAccess": False}
+    if mode == "danger-full-access":
+        return mode, True, {}, {"type": "dangerFullAccess"}
+    raise ValueError(f"sandbox no permitido: {mode!r}")
+
+
 # ---------------------------------------------------------------- app server
+
+def compact_error(value, limit=500):
+    """Reduce un error a una línea y evita volcar datos de la petición en los logs."""
+    text = str(value).strip().replace("\n", " ⏎ ")
+    return (text or type(value).__name__)[:limit]
+
+
+def redact_sensitive(value):
+    """Redacta tokens y valores con aspecto de secreto antes de registrar texto."""
+    text = str(value).replace("\n", " ⏎ ")
+    text = re.sub(r"Bearer\s+\S+", "Bearer [REDACTED]", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bsk-[A-Za-z0-9_-]+\b", "[REDACTED]", text)
+    text = re.sub(r"\b(key|token|password)\s*=\s*\S+", r"\1=[REDACTED]", text, flags=re.IGNORECASE)
+    return re.sub(r"\b[A-Za-z0-9+/=_-]{24,}\b", "[REDACTED]", text)
+
+
+class AppServerSendError(OSError):
+    """Fallo del envío, con indicación de si llegó algún byte al proceso."""
+
+    def __init__(self, method, cause, written=False):
+        self.method = method
+        self.cause = cause
+        self.written = written
+        super().__init__(f"{method}: app server send failed: {compact_error(cause)}")
+
 
 class AppServer:
     """One JSON-RPC connection to `codex app-server` over stdio."""
@@ -140,61 +432,202 @@ class AppServer:
     def __init__(self, on_request=None, on_note=None):
         if not os.access(CODEX, os.X_OK):
             sys.exit(f"Codex binary not found at {CODEX}. Set CODEX_BIN.")
-        self.p = subprocess.Popen([CODEX, "app-server"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                  stderr=subprocess.DEVNULL, text=True, bufsize=1)
         self.on_request, self.on_note = on_request, on_note
         self.n, self.waiting, self.wlock = 0, {}, threading.Lock()
-        # A reader thread, not select(): select() misses lines Python already buffered.
-        threading.Thread(target=self._pump, daemon=True).start()
-        self.call("initialize", {"clientInfo": {"name": "claude-codex-bridge", "version": "1"},
-                                 "capabilities": {"experimentalApi": True}})
-        self._send({"jsonrpc": "2.0", "method": "initialized"})
-
-    def _send(self, o):
-        with self.wlock:
-            self.p.stdin.write(json.dumps(o) + "\n")
-            self.p.stdin.flush()
-
-    def _pump(self):
-        for line in self.p.stdout:
+        self.pending_archives = {}  # hilo → respuesta aún pendiente tras un timeout
+        self.p, self._stderr_thread = None, None
+        self._pump_done = threading.Event()
+        self._stderr_state = {"lines": 0, "error": None}
+        for attempt in range(2):
+            proc = None
+            waiting = {}
+            pump_done = threading.Event()
+            stderr_state = {"lines": 0, "error": None}
             try:
-                o = json.loads(line)
-            except ValueError:
-                continue
-            if "id" in o and "method" not in o:
-                q = self.waiting.pop(o["id"], None)
-                if q:
-                    q.put(o)
-            elif "id" in o:
-                threading.Thread(target=self._request, args=(o,), daemon=True).start()
-            elif self.on_note:
-                self.on_note(o)
-        for q in list(self.waiting.values()):
-            q.put({"error": {"message": "Codex app server exited"}})
+                proc = subprocess.Popen([CODEX, "app-server"], stdin=subprocess.PIPE,
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                        cwd=Path.home(), text=True, bufsize=1)
+                self.p = proc
+                self.waiting = waiting
+                self._pump_done = pump_done
+                self._stderr_state = stderr_state
+                self._stderr_thread = threading.Thread(target=self._read_stderr,
+                                                        args=(proc.stderr, stderr_state), daemon=True)
+                self._stderr_thread.start()
+                # A reader thread, not select(): select() misses lines Python already buffered.
+                threading.Thread(target=self._pump, args=(proc, waiting, pump_done), daemon=True).start()
+                result = self.call("initialize", {
+                    "clientInfo": {"name": "claude-codex-bridge", "version": "1"},
+                    "capabilities": {"experimentalApi": True},
+                }, proc=proc, waiting=waiting)
+                if "error" in result:
+                    raise RuntimeError((result.get("error") or {}).get("message", "initialize failed"))
+                self._send({"jsonrpc": "2.0", "method": "initialized"}, proc=proc)
+                return
+            except Exception as exc:
+                self._log_start_error(exc, proc, stderr_state, self._stderr_thread, attempt + 1)
+                self._wake_waiting(waiting)
+                self._terminate(proc)
+                if attempt:
+                    raise
 
-    def _request(self, o):
+    def _read_stderr(self, stream, state):
+        try:
+            for line in stream:
+                line = line.strip()
+                state["lines"] += 1
+                if state["error"] is None and line.startswith("Error:"):
+                    state["error"] = redact_sensitive(line)
+        except (OSError, ValueError):
+            pass
+
+    def _stderr_summary(self, state, thread, proc):
+        if thread and proc and proc.poll() is not None:
+            thread.join(timeout=0.5)
+        error_line = state.get("error")
+        return "Error:" if error_line else None
+
+    def _log_start_error(self, exc, proc, stderr_state, stderr_thread, attempt):
+        record = {"event": "app_server_start_error", "pid": proc.pid if proc else None,
+                  "method": "initialize", "attempt": attempt,
+                  "returncode": proc.poll() if proc else None,
+                  "stderr_lines": stderr_state["lines"]}
+        stderr_error = self._stderr_summary(stderr_state, stderr_thread, proc)
+        if stderr_error:
+            record["stderr_error"] = stderr_error
+        append(LOG, record)
+        detail = f" stderr_error={stderr_error}" if stderr_error else ""
+        emit(f"app-server start error pid={record['pid']} method=initialize "
+             f"returncode={record['returncode']} stderr_lines={record['stderr_lines']}{detail}")
+
+    def _send(self, o, proc=None):
+        proc = proc or self.p
+        with self.wlock:
+            payload = (json.dumps(o) + "\n").encode()
+            sent = 0
+            try:
+                while sent < len(payload):
+                    count = os.write(proc.stdin.fileno(), payload[sent:])
+                    if not count:
+                        raise BrokenPipeError("app server stdin accepted no bytes")
+                    sent += count
+            except (BrokenPipeError, OSError) as exc:
+                raise AppServerSendError(o.get("method", "response"), exc, written=sent > 0) from exc
+
+    def _pump(self, proc, waiting, pump_done):
+        try:
+            for line in proc.stdout:
+                if proc is not self.p:
+                    continue
+                try:
+                    o = json.loads(line)
+                except ValueError:
+                    continue
+                if "id" in o and "method" not in o:
+                    q = waiting.pop(o["id"], None)
+                    if q:
+                        q.put(o)
+                elif "id" in o:
+                    threading.Thread(target=self._request, args=(proc, o), daemon=True).start()
+                elif self.on_note:
+                    self.on_note(o)
+        except (ValueError, OSError):
+            pass
+        finally:
+            self._wake_waiting(waiting)
+            pump_done.set()
+
+    def _request(self, proc, o):
         result = self.on_request(o) if self.on_request else None
-        if result is None:
-            self._send({"jsonrpc": "2.0", "id": o["id"],
-                        "error": {"code": -32601, "message": f"{o['method']} is not handled by the bridge"}})
-        else:
-            self._send({"jsonrpc": "2.0", "id": o["id"], "result": result})
+        try:
+            if result is None:
+                self._send({"jsonrpc": "2.0", "id": o["id"],
+                            "error": {"code": -32601, "message": f"{o['method']} is not handled by the bridge"}},
+                           proc=proc)
+            else:
+                self._send({"jsonrpc": "2.0", "id": o["id"], "result": result}, proc=proc)
+        except (AppServerSendError, BrokenPipeError, OSError):
+            pass
 
-    def call(self, method, params, timeout=60):
+    @staticmethod
+    def _wake_waiting(waiting):
+        for q in list(waiting.values()):
+            q.put({"error": {"message": "Codex app server exited"}})
+        waiting.clear()
+
+    @staticmethod
+    def _terminate(proc):
+        if not proc:
+            return
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+            proc.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+                proc.wait(timeout=0.5)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        except OSError:
+            pass
+        finally:
+            AppServer._close_streams(proc)
+
+    @staticmethod
+    def _close_streams(proc):
+        for stream in (proc.stdin, proc.stdout, proc.stderr):
+            try:
+                if stream:
+                    stream.close()
+            except (OSError, ValueError):
+                pass
+
+    def call(self, method, params, timeout=60, proc=None, waiting=None):
+        proc = proc or self.p
+        waiting = waiting if waiting is not None else self.waiting
+        tid = params.get("threadId")
+        pending = self.pending_archives.get(tid)
+        if method == "thread/read" and pending is not None:
+            # Leer archived=False antes de que termine archive no confirma nada.
+            if pending.empty():
+                return {"error": {"message": "archive pendiente; no se puede conciliar todavía"}}
+            self.pending_archives.pop(tid)
         with self.wlock:
             self.n += 1
             i = self.n
         q = queue.Queue()
-        self.waiting[i] = q
-        self._send({"jsonrpc": "2.0", "id": i, "method": method, "params": params})
+        waiting[i] = q
+        if proc.poll() is not None:
+            waiting.pop(i, None)
+            raise AppServerSendError(method, "process already terminated")
+        try:
+            self._send({"jsonrpc": "2.0", "id": i, "method": method, "params": params}, proc=proc)
+        except AppServerSendError:
+            waiting.pop(i, None)
+            raise
+        except (BrokenPipeError, OSError) as exc:
+            waiting.pop(i, None)
+            raise AppServerSendError(method, exc) from exc
+
         try:
             return q.get(timeout=timeout)
         except queue.Empty:
-            self.waiting.pop(i, None)
-            return {"error": {"message": f"{method}: no response in {timeout}s"}}
+            error = {"message": f"{method}: no response in {timeout}s"}
+            if method == "thread/archive":
+                # El envío ya se completó: conservar la respuesta tardía, nunca reenviar.
+                self.pending_archives[tid] = q
+                error["data"] = {"archive_uncertain": True}
+            else:
+                waiting.pop(i, None)
+            return {"error": error}
 
     def close(self):
-        self.p.terminate()
+        proc = self.p
+        if not proc:
+            return
+        self._wake_waiting(self.waiting)
+        self._terminate(proc)
 
 
 # ---------------------------------------------------------------- daemon
@@ -239,17 +672,66 @@ class Daemon:
         self.touched = {}                      # threadId -> last use
         self.inflight = defaultdict(int)       # threadId -> calls in progress on its worker
         self.tlocks = defaultdict(threading.Lock)  # one worker start per thread at a time
+        self.cycle_locks = defaultdict(threading.RLock)  # decisión de tidy y todos los RPC del hilo
         self.lock = threading.Lock()
+        self._tidy_stop = threading.Event()
+        self._tidy_thread = None
         threading.Thread(target=self._reap, daemon=True).start()
 
     @property
     def main(self):
         """Restart the read connection if its app server exited, instead of failing every read."""
         with self.mlock:
-            if self._main.p.poll() is not None:
+            if self._main is None or self._main.p.poll() is not None:
                 append(LOG, {"event": "main_restarted"})
                 self._main = AppServer(on_request=handle_tool_call)
             return self._main
+
+    def _main_call(self, method, params, timeout):
+        for attempt in range(2):
+            worker = self.main
+            try:
+                return worker.call(method, params, timeout)
+            except AppServerSendError as exc:
+                with self.mlock:
+                    if self._main is worker:
+                        self._main = None
+                worker.close()
+                if exc.written:
+                    raise
+                if attempt:
+                    raise
+
+    def call(self, method, params=None, timeout=60):
+        """Expone la interfaz de Client para el barrido en segundo plano."""
+        request = dict(params or {})
+        request["_timeout"] = timeout
+        return self.rpc(method, request)
+
+    def _periodic_tidy(self):
+        while not self._tidy_stop.is_set():
+            try:
+                if os.environ.get("CLAUDE_CODEX_BRIDGE_AUTOTIDY", "1").strip() != "0":
+                    result = cmd_tidy(self, argparse.Namespace(hours=tidy_hours(), dry_run=False, quiet=True), silent=True)
+                    if result:
+                        raise RuntimeError("el barrido terminó con errores; ver tidy_failed")
+            except (Exception, SystemExit) as exc:
+                append(LOG, {"event": "tidy_daemon_failed", "error": compact_error(exc)})
+            if self._tidy_stop.wait(TIDY_INTERVAL_SECONDS):
+                return
+
+    def start_periodic_tidy(self):
+        """Inicia la limpieza en un hilo independiente de las peticiones RPC."""
+        if self._tidy_thread and self._tidy_thread.is_alive():
+            return
+        self._tidy_stop.clear()
+        self._tidy_thread = threading.Thread(target=self._periodic_tidy, name="bridge-tidy", daemon=True)
+        self._tidy_thread.start()
+
+    def stop_periodic_tidy(self):
+        self._tidy_stop.set()
+        if self._tidy_thread and self._tidy_thread is not threading.current_thread():
+            self._tidy_thread.join(timeout=1)
 
     def note(self, o):
         m, p = o.get("method"), o.get("params") or {}
@@ -269,10 +751,11 @@ class Daemon:
             with self.lock:
                 for tid in list(self.workers):
                     w = self.workers[tid]
-                    if w.p.poll() is not None:  # worker died: forget it, or the thread looks busy forever
+                    if w.p.poll() is not None and w._pump_done.is_set():  # EOF confirms the pump drained stdout
                         self.workers.pop(tid)
                         self.running.pop(tid, None)
-                    elif (tid not in self.running and not self.inflight[tid]
+                    elif (w.p.poll() is None and tid not in self.running and not self.inflight[tid]
+                          and not w.pending_archives
                           and time.time() - self.touched.get(tid, 0) > IDLE_CLOSE):
                         self.workers.pop(tid).close()
 
@@ -284,7 +767,11 @@ class Daemon:
                     return w, None
             w = AppServer(on_request=handle_tool_call, on_note=self.note)
             if method != "thread/resume":
-                r = w.call("thread/resume", {"threadId": tid})
+                try:
+                    r = w.call("thread/resume", {"threadId": tid})
+                except AppServerSendError:
+                    w.close()
+                    raise
                 if "error" in r:
                     w.close()
                     return None, r
@@ -294,7 +781,41 @@ class Daemon:
             return w, None
 
     def rpc(self, method, params):
-        timeout = params.pop("_timeout", 60)
+        params = dict(params)
+        deadline = min(params.get("_deadline", float("inf")),
+                       time.monotonic() + params.get("_timeout", 60))
+        _remaining(deadline)
+        params["_deadline"] = deadline
+        tid = params.get("threadId")
+        # Solo tidy posee aquí el registro: siempre threads.lock → cycle_lock.
+        # send/watch ya protegen su reapertura con threads.lock en el cliente.
+        registry_lock = _thread_lock(deadline) if method == "bridge/tidy-archive" else None
+        try:
+            if tid:
+                cycle = self.cycle_locks[tid]
+                if not cycle.acquire(timeout=_remaining(deadline)):
+                    raise TimeoutError("petición vencida esperando cycle_lock")
+                try:
+                    _remaining(deadline)
+                    self.inflight[tid] += 1
+                    try:
+                        return self._rpc(method, params)
+                    finally:
+                        self.inflight[tid] -= 1
+                finally:
+                    cycle.release()
+            return self._rpc(method, params)
+        finally:
+            if registry_lock is not None:
+                _release_thread_lock(registry_lock)
+
+    def _rpc(self, method, params):
+        deadline = params.pop("_deadline")
+        timeout = min(params.pop("_timeout", 60), _remaining(deadline))
+        if method == "bridge/tidy-archive":
+            status = _tidy_registered(self, params["threadId"], params["cutoff"],
+                                      params.get("dryRun", False), deadline)
+            return {"result": {"status": status}}
         if method == "bridge/ping":
             return {"result": {"pid": os.getpid(), "running": self.running, "workers": list(self.workers)}}
         if method == "bridge/running":
@@ -302,35 +823,79 @@ class Daemon:
         if method not in WRITES:
             # A thread a worker has loaded is only visible to that worker until its rollout exists.
             w = self.workers.get(params.get("threadId")) if isinstance(params, dict) else None
-            return (w or self.main).call(method, params, timeout)
+            if w:
+                tid = params.get("threadId")
+                self.inflight[tid] += 1
+                try:
+                    for attempt in range(2):
+                        try:
+                            return w.call(method, params, timeout)
+                        except AppServerSendError as exc:
+                            with self.lock:
+                                if self.workers.get(tid) is w:
+                                    self.workers.pop(tid)
+                            w.close()
+                            if exc.written:
+                                raise
+                            if attempt:
+                                raise
+                            w, err = self._worker(tid, method)
+                            if err:
+                                return err
+                finally:
+                    self.inflight[tid] -= 1
+                    self.touched[tid] = time.time()
+            return self._main_call(method, params, timeout)
         if method in ("thread/start", "thread/fork"):
-            w = AppServer(on_request=handle_tool_call, on_note=self.note)
-            r = w.call(method, params, timeout)
-            tid = ((r.get("result") or {}).get("thread") or {}).get("id")
-            if not tid:
-                w.close()
+            for attempt in range(2):
+                w = AppServer(on_request=handle_tool_call, on_note=self.note)
+                try:
+                    r = w.call(method, params, timeout)
+                except AppServerSendError as exc:
+                    w.close()
+                    if exc.written:
+                        raise
+                    if attempt:
+                        raise
+                    continue
+                tid = ((r.get("result") or {}).get("thread") or {}).get("id")
+                if not tid:
+                    w.close()
+                    return r
+                with self.lock:
+                    self.workers[tid] = w
+                    self.touched[tid] = time.time()
                 return r
-            with self.lock:
-                self.workers[tid] = w
-                self.touched[tid] = time.time()
-            return r
         tid = params.get("threadId")
         self.inflight[tid] += 1  # the reaper never closes a worker mid-call
         try:
-            w, err = self._worker(tid, method)
-            if err:
-                return err
-            r = w.call(method, params, timeout)
-            if method == "thread/resume" and "error" in r:
-                with self.lock:
-                    if self.workers.get(tid) is w:
-                        self.workers.pop(tid)
-                w.close()
-            if method == "turn/start" and "result" in r:
-                t = r["result"]["turn"]["id"]
-                if t not in self.done:  # a turn that ended before this reply must not stay "running"
-                    self.running[tid] = t
-            return r
+            for attempt in range(2):
+                w = None
+                try:
+                    w, err = self._worker(tid, method)
+                    if err:
+                        return err
+                    r = w.call(method, params, timeout)
+                    if method == "thread/resume" and "error" in r:
+                        with self.lock:
+                            if self.workers.get(tid) is w:
+                                self.workers.pop(tid)
+                        w.close()
+                    if method == "turn/start" and "result" in r:
+                        t = r["result"]["turn"]["id"]
+                        if t not in self.done:  # a turn that ended before this reply must not stay "running"
+                            self.running[tid] = t
+                    return r
+                except AppServerSendError as exc:
+                    if w:
+                        with self.lock:
+                            if self.workers.get(tid) is w:
+                                self.workers.pop(tid)
+                        w.close()
+                    if exc.written:
+                        raise
+                    if attempt:
+                        raise
         finally:
             self.inflight[tid] -= 1
             self.touched[tid] = time.time()
@@ -347,14 +912,21 @@ def serve():
         sys.exit("bridge daemon already running")
     SOCK.unlink(missing_ok=True)
     d = Daemon()
+    d.start_periodic_tidy()
 
     class H(socketserver.StreamRequestHandler):
         def handle(self):
+            req = None
             for line in self.rfile:
                 try:
                     req = json.loads(line)
                     res = d.rpc(req["method"], req.get("params") or {})
                 except Exception as e:  # keep the daemon up on any bad request
+                    method = req.get("method") if isinstance(req, dict) else None
+                    record = {"event": "rpc_error", "pid": os.getpid(), "method": method,
+                              "error": compact_error(e)}
+                    append(LOG, record)
+                    emit(f"rpc error pid={record['pid']} method={method} error={record['error']}")
                     res = {"error": {"message": f"bridge: {e}"}}
                 self.wfile.write((json.dumps(res) + "\n").encode())
                 self.wfile.flush()
@@ -369,6 +941,7 @@ def serve():
     try:
         s.serve_forever()
     finally:
+        d.stop_periodic_tidy()
         SOCK.unlink(missing_ok=True)
 
 
@@ -391,8 +964,10 @@ def up():
         fcntl.flock(lk, fcntl.LOCK_EX)
         if ping():
             return
-        subprocess.Popen([sys.executable, os.path.abspath(__file__), "serve"], start_new_session=True,
-                         stdin=subprocess.DEVNULL, stdout=open(HOME / "daemon.log", "a"), stderr=subprocess.STDOUT)
+        with open(HOME / "daemon.log", "a") as daemon_log:
+            subprocess.Popen([sys.executable, os.path.abspath(__file__), "serve"], cwd=Path.home(),
+                             start_new_session=True, stdin=subprocess.DEVNULL,
+                             stdout=daemon_log, stderr=subprocess.STDOUT)
         for _ in range(100):
             if ping():
                 return
@@ -410,6 +985,11 @@ class Client:
 
     def call(self, method, params=None, timeout=60):
         params = dict(params or {})
+        # El reloj monotónico es propio de cada proceso en macOS: al daemon solo
+        # viaja el margen restante, nunca un instante absoluto de este proceso.
+        deadline = params.pop("_deadline", None)
+        if deadline is not None:
+            timeout = min(timeout, _remaining(deadline))
         params["_timeout"] = timeout
         self.c.settimeout(timeout + 15)  # a stuck daemon never hangs the command
         try:
@@ -518,9 +1098,11 @@ def watch(tid, timeout=3300, path=None, offset=None, turn_id=None, match_text=No
                         emit(f"CODEX: {(it.get('arguments') or {}).get('message', '')}")
                 elif t == "task_complete":
                     emit(f"DONE {now()}: {p.get('last_agent_message') or ''}")
+                    mark_consumed(tid, p.get("turn_id"))
                     return 0
                 elif t in ("turn_aborted", "task_aborted"):
                     emit(f"FAILED {now()}: turn {p.get('reason', 'aborted')}")
+                    mark_consumed(tid, p.get("turn_id"))
                     return 5
             continue
         if time.time() >= next_check:
@@ -547,13 +1129,13 @@ def file_size(path):
 
 # ---------------------------------------------------------------- commands
 
-def held_by_app(c, tid):
+def held_by_app(c, tid, deadline=None):
     """Resume through the daemon. Returns True when another process (the ChatGPT app) is the writer."""
-    r = c.call("thread/resume", {"threadId": tid})
+    r = _tidy_call(c, "thread/resume", {"threadId": tid}, 60, deadline)
     if "error" in r:
         if LOCKED in r["error"].get("message", ""):
             return True
-        ok(r, "thread/resume")
+        raise RuntimeError(r["error"].get("message", "thread/resume falló"))
     return False
 
 
@@ -601,12 +1183,21 @@ def call_held(c, method, params):
     return r
 
 
-def turn_params(tid, text, a):
+def turn_params(tid, text, a, policy=None, allow_overrides=True):
     p = {"threadId": tid, "input": [{"type": "text", "text": text}]}
-    if getattr(a, "model", None):
-        p["model"] = a.model
-    if getattr(a, "effort", None):
-        p["effort"] = a.effort
+    stored = policy if policy is not None else load_threads().get(tid, {})
+    if stored.get("sandbox") and stored.get("cwd"):
+        _, _, _, sandbox_policy = execution_policy(
+            Path(stored["cwd"]), sandbox=stored["sandbox"],
+            no_network=not stored.get("network_access", True),
+        )
+        p["sandboxPolicy"] = sandbox_policy
+    model = (getattr(a, "model", None) if allow_overrides else None) or stored.get("model")
+    effort = (getattr(a, "effort", None) if allow_overrides else None) or stored.get("effort")
+    if model:
+        p["model"] = model
+    if effort:
+        p["effort"] = effort
     return p
 
 
@@ -622,74 +1213,176 @@ def set_title(c, tid, title):
     return False
 
 
+def launch_autotidy():
+    """Respaldo sin daemon; con daemon vivo basta su barrido periódico."""
+    if os.environ.get("CLAUDE_CODEX_BRIDGE_AUTOTIDY", "1").strip() == "0":
+        return
+    if ping():
+        return
+    try:
+        subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "tidy", "--hours", tidy_hours_arg(), "--quiet"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        emit(f"WARN: no se pudo lanzar autotidy: {compact_error(exc)}")
+
+
+def _release_thread_lock(lock):
+    fcntl.flock(lock, fcntl.LOCK_UN)
+    os.close(lock)
+
+
+def _clear_archived_locked(tid):
+    """Reconcilia una reapertura confirmada; el llamador posee threads.lock."""
+    records = load_threads()
+    record = records.get(tid) if isinstance(records, dict) else None
+    if isinstance(record, dict) and "archived_at" in record:
+        record.pop("archived_at")
+        _write_threads(records)
+
+
+def _ensure_unarchived_locked(c, tid, force=False):
+    """Reabre un hilo archivado antes de continuar un encargo sobre él."""
+    r = c.call("thread/read", {"threadId": tid}, timeout=10)
+    if "error" in r:
+        ok(r, "thread/read")
+    thread = (r.get("result") or {}).get("thread")
+    if force or (isinstance(thread, dict) and thread.get("archived") is True):
+        ok(call_held(c, "thread/unarchive", {"threadId": tid}), "thread/unarchive")
+        _clear_archived_locked(tid)
+        emit(f"UNARCHIVED {tid}")
+    elif isinstance(thread, dict) and thread.get("archived") is False:
+        _clear_archived_locked(tid)
+
+
+def ensure_unarchived(c, tid):
+    """Toma threads.lock y lo devuelve al llamador para cubrir el RPC siguiente."""
+    lock = _thread_lock()
+    try:
+        _ensure_unarchived_locked(c, tid)
+        return lock
+    except (Exception, SystemExit):
+        _release_thread_lock(lock)
+        raise
+
+
+def _archived_error(response):
+    return "archiv" in str((response.get("error") or {}).get("message", "")).lower()
+
+
 def cmd_start(c, a):
-    r = ok(c.call("thread/start", {"cwd": a.cwd, "dynamicTools": [TOOL], "developerInstructions": INSTRUCTIONS}),
-           "thread/start")
+    try:
+        cwd = normalize_cwd(a.cwd)
+        mode, network_access, config, _ = execution_policy(
+            cwd, sandbox=getattr(a, "sandbox", None), full_access=getattr(a, "full_access", False),
+            no_network=getattr(a, "no_network", False),
+        )
+        route = route_model(a.role)
+    except (AttributeError, ValueError) as exc:
+        emit(f"FAILED: start no autorizado: {exc}")
+        return 5
+    thread_params = {
+        "cwd": str(cwd), "dynamicTools": [TOOL], "developerInstructions": INSTRUCTIONS,
+        "sandbox": mode, "approvalPolicy": "never", "model": route["model"],
+    }
+    if config:
+        thread_params["config"] = config
+    r = ok(c.call("thread/start", thread_params), "thread/start")
     tid = r["thread"]["id"]
-    save_thread(tid, **{"from": a.sender, "title": a.title})
+    policy = {"from": a.sender, "agent": getattr(a, "agent", None), "title": a.title, "role": a.role,
+              "cwd": str(cwd), "sandbox": mode, "network_access": network_access, "model": route["model"],
+              "effort": route["effort"]}
+    save_thread(tid, **policy)
     emit(f"THREAD {tid} codex://threads/{tid}")
     append(LOG, {"event": "start", "thread": tid, "from": a.sender, "title": a.title})
-    turn = ok(c.call("turn/start", turn_params(tid, a.prompt, a)), "turn/start")["turn"]["id"]
+    turn = ok(c.call("turn/start", turn_params(tid, a.prompt, a, policy=policy, allow_overrides=False)),
+              "turn/start")["turn"]["id"]
     if a.title:
         set_title(c, tid, a.title)
-    if a.section:
-        move(c, tid, a.section)
+    move_target = a.section or os.environ.get("CLAUDE_CODEX_BRIDGE_SECTION", "").strip() or "🤖 Agentes-encargos"
+    move_best_effort(c, tid, move_target)
+    launch_autotidy()
     if a.no_watch:
         return 0
     return watch(tid, a.timeout, offset=0, turn_id=turn)
 
 
 def cmd_send(c, a):
-    path = rollout_path(a.thread, wait=0)
-    off = file_size(path)
-    if held_by_app(c, a.thread):
-        if app_port_up():
-            if app_active_turn(a.thread):
-                emit("FAILED: a turn is running in the ChatGPT app. Use steer to add to it, or wait.")
-                return 5
-            r = app_call("turn/start", turn_params(a.thread, a.prompt, a))
-            if r and "result" in r:
-                turn = r["result"]["turn"]["id"]
-                emit(f"SENT {now()} to {a.thread} turn {turn} (through the ChatGPT app)")
-                append(LOG, {"event": "sent_app", "thread": a.thread, "turn": turn})
-                return 0 if a.no_watch else watch(a.thread, a.timeout, path=path, offset=off, turn_id=turn)
-            emit(f"WARN: app route failed ({(r or {}).get('error', {}).get('message')}); queueing instead")
-        r = ok(c.call("thread/queue/add", {"threadId": a.thread, "clientUserMessageId": str(uuid.uuid4()),
-                                           "input": [{"type": "text", "text": a.prompt}]}), "thread/queue/add")
-        emit(f"QUEUED {now()} {r['queuedSubmission'].get('id')}: the ChatGPT app holds this thread; "
-             "it checks its queue about every 10 s and then starts the turn")
-        append(LOG, {"event": "queued", "thread": a.thread})
-        return 0 if a.no_watch else watch(a.thread, a.timeout, path=path, offset=off, match_text=a.prompt)
-    running = c.call("bridge/running", {"threadId": a.thread}).get("result", {}).get("turnId")
-    if running:
-        emit(f"FAILED: a turn is running ({running}). Use steer to add to it, or wait.")
-        return 5
-    turn = ok(c.call("turn/start", turn_params(a.thread, a.prompt, a)), "turn/start")["turn"]["id"]
-    emit(f"SENT {now()} to {a.thread} turn {turn}")
-    append(LOG, {"event": "sent", "thread": a.thread, "turn": turn})
-    if a.no_watch:
-        return 0
-    return watch(a.thread, a.timeout, path=path, offset=off, turn_id=turn)
+    lock = ensure_unarchived(c, a.thread)
+    try:
+        path = rollout_path(a.thread, wait=0)
+        off = file_size(path)
+        if held_by_app(c, a.thread):
+            if app_port_up():
+                if app_active_turn(a.thread):
+                    emit("FAILED: a turn is running in the ChatGPT app. Use steer to add to it, or wait.")
+                    return 5
+                r = app_call("turn/start", turn_params(a.thread, a.prompt, a))
+                if r and "error" in r and _archived_error(r):
+                    _ensure_unarchived_locked(c, a.thread, force=True)
+                    r = app_call("turn/start", turn_params(a.thread, a.prompt, a))
+                if r and "result" in r:
+                    turn = r["result"]["turn"]["id"]
+                    emit(f"SENT {now()} to {a.thread} turn {turn} (through the ChatGPT app)")
+                    append(LOG, {"event": "sent_app", "thread": a.thread, "turn": turn})
+                    _release_thread_lock(lock)
+                    lock = None
+                    return 0 if a.no_watch else watch(a.thread, a.timeout, path=path, offset=off, turn_id=turn)
+                emit(f"WARN: app route failed ({(r or {}).get('error', {}).get('message')}); queueing instead")
+            r = ok(c.call("thread/queue/add", {"threadId": a.thread, "clientUserMessageId": str(uuid.uuid4()),
+                                               "input": [{"type": "text", "text": a.prompt}]}), "thread/queue/add")
+            emit(f"QUEUED {now()} {r['queuedSubmission'].get('id')}: the ChatGPT app holds this thread; "
+                 "it checks its queue about every 10 s and then starts the turn")
+            append(LOG, {"event": "queued", "thread": a.thread})
+            _release_thread_lock(lock)
+            lock = None
+            return 0 if a.no_watch else watch(a.thread, a.timeout, path=path, offset=off, match_text=a.prompt)
+        running = c.call("bridge/running", {"threadId": a.thread}).get("result", {}).get("turnId")
+        if running:
+            emit(f"FAILED: a turn is running ({running}). Use steer to add to it, or wait.")
+            return 5
+        turn_response = c.call("turn/start", turn_params(a.thread, a.prompt, a))
+        if _archived_error(turn_response):
+            _ensure_unarchived_locked(c, a.thread, force=True)
+            turn_response = c.call("turn/start", turn_params(a.thread, a.prompt, a))
+        turn = ok(turn_response, "turn/start")["turn"]["id"]
+        emit(f"SENT {now()} to {a.thread} turn {turn}")
+        append(LOG, {"event": "sent", "thread": a.thread, "turn": turn})
+        _release_thread_lock(lock)
+        lock = None
+        if a.no_watch:
+            return 0
+        return watch(a.thread, a.timeout, path=path, offset=off, turn_id=turn)
+    finally:
+        if lock is not None:
+            _release_thread_lock(lock)
 
 
 def cmd_watch(c, a):
     """Follow the turn that is running, or the next one if a message is waiting; otherwise
     print the last answer. --from-start replays the latest turn."""
+    lock = ensure_unarchived(c, a.thread)
+    _release_thread_lock(lock)
     path = rollout_path(a.thread, wait=0)
     if not path:
         emit(f"FAILED: no rollout file for {a.thread}")
         return 5
+    seen_at = time.time()  # antes de leer: lo que termine después sigue pendiente
     size = file_size(path)
     lines = tail_lines(path)
     pos = size - sum(len(x) + 1 for x in lines) + 1  # byte offset of the first complete line
-    start_at, ended, answer = None, False, ""
+    start_at, ended, answer, last_turn = None, False, "", None
     for raw in lines:
         if b'"task_started"' in raw:
             start_at, ended = pos, False
-        elif b'"task_complete"' in raw or b'"turn_aborted"' in raw:
+        elif b'"task_complete"' in raw or b'"turn_aborted"' in raw or b'"task_aborted"' in raw:
             ended = True
             try:
-                answer = (json.loads(raw).get("payload") or {}).get("last_agent_message") or ""
+                payload = json.loads(raw).get("payload") or {}
+                answer = payload.get("last_agent_message") or ""
+                last_turn = payload.get("turn_id") or last_turn
             except ValueError:
                 pass
         pos += len(raw) + 1
@@ -705,6 +1398,7 @@ def cmd_watch(c, a):
         emit(f"WAITING {now()}: " + (f"turn {busy} is starting" if busy else f"{len(waiting)} queued message(s)"))
         return watch(a.thread, a.timeout, path=path, offset=size, turn_id=busy)
     emit("IDLE: no turn running. Last answer: " + answer)
+    mark_consumed(a.thread, last_turn, seen_at)
     return 0
 
 
@@ -737,17 +1431,21 @@ def app_turn_op(c, a, method, verb):
 
 
 def cmd_steer(c, a):
-    r = app_turn_op(c, a, "turn/steer", "STEERED")
-    if r is not None:
-        return r
-    t = active_turn(c, a.thread)
-    if not t:
-        emit("FAILED: no running turn in this thread.")
-        return 5
-    ok(c.call("turn/steer", {"threadId": a.thread, "expectedTurnId": t, "input": [{"type": "text", "text": a.text}]}),
-       "turn/steer")
-    emit(f"STEERED {now()} turn {t}")
-    return 0
+    lock = ensure_unarchived(c, a.thread)
+    try:
+        r = app_turn_op(c, a, "turn/steer", "STEERED")
+        if r is not None:
+            return r
+        t = active_turn(c, a.thread)
+        if not t:
+            emit("FAILED: no running turn in this thread.")
+            return 5
+        ok(c.call("turn/steer", {"threadId": a.thread, "expectedTurnId": t, "input": [{"type": "text", "text": a.text}]}),
+           "turn/steer")
+        emit(f"STEERED {now()} turn {t}")
+        return 0
+    finally:
+        _release_thread_lock(lock)
 
 
 def cmd_stop(c, a):
@@ -778,6 +1476,7 @@ def cmd_list(c, a):
 
 
 def cmd_read(c, a):
+    seen_at = time.time()  # antes de leer: lo que termine después sigue pendiente
     r = ok(c.call("thread/read", {"threadId": a.thread, "includeTurns": True}), "thread/read")
     t = r["thread"]
     turns = t.get("turns", [])
@@ -791,6 +1490,8 @@ def cmd_read(c, a):
                 print("agent:", i.get("text", ""))
             elif i.get("type") == "dynamicToolCall":
                 print("send_to_claude:", (i.get("arguments") or {}).get("message", ""))
+    if turns and turns[-1].get("status") != "inProgress":
+        mark_consumed(a.thread, turns[-1].get("id"), seen_at)
     return 0
 
 
@@ -843,13 +1544,324 @@ def move(c, tid, sec):
     return 0
 
 
+def move_best_effort(c, tid, sec):
+    """Mueve un hilo de start sin convertir un fallo de organización en fallo del start."""
+    try:
+        r = c.call("threadSection/list", {})
+        if "error" in r:
+            raise RuntimeError(r["error"].get("message", "threadSection/list falló"))
+        ss = (r.get("result") or {}).get("data", [])
+        hit = next((s for s in ss if s.get("id") == sec or s.get("name", "").lower() == sec.lower()), None)
+        if not hit:
+            raise ValueError(f"no existe la sección {sec!r}")
+        r = c.call("thread/section/move", {"threadId": tid, "sectionId": hit["id"]})
+        if "error" in r:
+            raise RuntimeError(r["error"].get("message", "thread/section/move falló"))
+        emit(f"MOVED {tid} to {hit.get('name')}")
+    except (Exception, SystemExit) as exc:
+        emit(f"WARN: no se pudo mover {tid} a {sec!r}: {compact_error(exc)}")
+    return 0
+
+
+def _timestamp(value):
+    """Convierte timestamps del app server, en segundos, milisegundos o ISO, a epoch."""
+    if isinstance(value, (int, float)):
+        value = float(value)
+        return value / 1000 if value > 1_000_000_000_000 else value
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.timestamp()
+        except ValueError:
+            try:
+                return _timestamp(float(value))
+            except ValueError:
+                return None
+    return None
+
+
+def _thread_from_response(response):
+    result = response.get("result") or {}
+    thread = result.get("thread")
+    return thread if isinstance(thread, dict) else None
+
+
+def _thread_list(response):
+    result = response.get("result") or {}
+    rows = result.get("data") or []
+    return [row.get("thread", row) for row in rows if isinstance(row, dict)]
+
+
+def _tidy_warn(tid, message, silent):
+    if not silent:
+        emit(f"WARN: tidy {tid}: {message}")
+
+
+def _tidy_call(c, method, params, timeout, deadline):
+    if deadline is not None:
+        timeout = min(timeout, _remaining(deadline))
+        params = dict(params, _deadline=deadline)
+    return c.call(method, params, timeout=timeout)
+
+
+def _tidy_active(c, tid, thread, deadline=None):
+    """Comprueba turnos activos y envíos pendientes antes de archivar."""
+    running = _tidy_call(c, "bridge/running", {"threadId": tid}, 5, deadline)
+    if "error" in running:
+        raise RuntimeError(running["error"].get("message", "bridge/running falló"))
+    if (running.get("result") or {}).get("turnId"):
+        return True
+    for turn in (thread or {}).get("turns") or []:
+        if str(turn.get("status", "")).lower() in {"inprogress", "in_progress", "running", "started"}:
+            return True
+    queued = _tidy_call(c, "thread/queue/list", {"threadId": tid}, 5, deadline)
+    if "error" in queued:
+        raise RuntimeError(queued["error"].get("message", "thread/queue/list falló"))
+    if (queued.get("result") or {}).get("data"):
+        return True
+    return False
+
+
+def _tidy_lock():
+    HOME.mkdir(parents=True, exist_ok=True)
+    fd = os.open(HOME / "tidy.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def _archived_rollout_ids(strict=False):
+    """Hilos cuyo rollout ya está en archived_sessions (archivados desde la app o por otro proceso).
+
+    El app-server del daemon puede tener el hilo en memoria y seguir diciendo archived=false;
+    el disco es la fuente fiable y evita un thread/archive que fallaría con «no rollout found»."""
+    try:
+        names = os.listdir(ARCHIVED_SESSIONS)
+    except FileNotFoundError:
+        return set()  # Sin directorio de archivados todavía no hay rollouts archivados.
+    except OSError:
+        if strict:
+            raise  # Conciliar exige verificar el disco, no asumir que está vacío.
+        return set()
+    ids = set()
+    for name in names:
+        m = ROLLOUT_ID.search(name)
+        if m:
+            ids.add(m.group(1))
+    return ids
+
+
+def _tidy_archive(c, tid, cutoff, dry_run, deadline=None):
+    """Decide y archiva dentro del lock de ciclo del daemon, conservando el writer."""
+    if held_by_app(c, tid, deadline):
+        return "skipped"
+    response = _tidy_call(c, "thread/read", {"threadId": tid, "includeTurns": True}, 10, deadline)
+    if "error" in response:
+        raise RuntimeError(response["error"].get("message", "thread/read falló"))
+    thread = _thread_from_response(response)
+    if not thread:
+        raise RuntimeError("thread/read no devolvió el hilo")
+    if thread.get("archived") is True or _tidy_active(c, tid, thread, deadline):
+        return "skipped"
+    activity = _timestamp(thread.get("recencyAt") or thread.get("updatedAt"))
+    if activity is None or activity > cutoff:
+        return "skipped"
+    if dry_run:
+        return "would_archive"
+    # Nunca reenviar a la app: su writer debe impedir este archivado automático.
+    response = _tidy_call(c, "thread/archive", {"threadId": tid}, 60, deadline)
+    if ((response.get("error") or {}).get("data") or {}).get("archive_uncertain"):
+        return "uncertain"
+    if LOCKED in ((response.get("error") or {}).get("message") or ""):
+        return "skipped"
+    if "error" in response:
+        raise RuntimeError(response["error"].get("message", "thread/archive falló"))
+    return "archived"
+
+
+def _reconcile_archive(c, tid, records, deadline=None, dry_run=False):
+    """Conciliación bajo threads.lock; un fallo conserva la marca y no permite keep."""
+    response = _tidy_call(c, "thread/read", {"threadId": tid}, 10, deadline)
+    if "error" in response:
+        raise RuntimeError(response["error"].get("message", "no se pudo conciliar archive"))
+    thread = _thread_from_response(response)
+    if not thread or not isinstance(thread.get("archived"), bool):
+        raise RuntimeError("thread/read no confirmó si el hilo está archivado")
+    disk_archived = tid in _archived_rollout_ids(strict=True)
+    archived = thread["archived"] or disk_archived
+    if not dry_run:
+        record = records[tid]
+        # Cualquier evidencia de archivado protege el hilo; solo el acuerdo resuelve la marca.
+        if thread["archived"] == disk_archived:
+            record.pop("archive_uncertain", None)
+        if archived:
+            record["archived_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        else:
+            record.pop("archived_at", None)
+        _write_threads(records)
+        append(LOG, {"event": "archive_reconciled", "thread": tid, "archived": archived})
+    return archived
+
+
+def _tidy_registered(c, tid, cutoff, dry_run, deadline):
+    """El daemon posee threads.lock y cycle_lock hasta confirmar y anotar el resultado."""
+    _remaining(deadline)
+    records = load_threads()
+    record = records.get(tid) if isinstance(records, dict) else None
+    if not isinstance(record, dict):
+        return "skipped"
+    if record.get("archive_uncertain"):
+        archived = _reconcile_archive(c, tid, records, deadline, dry_run)
+        # Este barrido solo concilia; no vuelve a enviar el archive incierto.
+        return "reconciled" if archived and not dry_run else "skipped"
+    if record.get("archived_at") or record.get("keep") is True:
+        return "skipped"
+    if tid in _archived_rollout_ids():
+        _remaining(deadline)
+        status = "skipped" if dry_run else "reconciled"
+    else:
+        status = _tidy_archive(c, tid, cutoff, dry_run, deadline)
+    if status == "uncertain":
+        record["archive_uncertain"] = True
+        _write_threads(records)
+        append(LOG, {"event": "archive_uncertain", "thread": tid})
+        raise RuntimeError("archive enviado sin respuesta; pendiente de conciliación")
+    if status in ("archived", "reconciled"):
+        # Tras un archive confirmado se persiste incluso si su respuesta agotó el plazo.
+        record["archived_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        _write_threads(records)
+        append(LOG, {"event": "tidy" if status == "archived" else "tidy_reconciled", "thread": tid})
+    return status
+
+
+def _tidy_one(c, tid, cutoff, dry_run, silent):
+    """El cliente solo solicita y muestra el resultado; no retiene threads.lock."""
+    response = c.call("bridge/tidy-archive", {"threadId": tid, "cutoff": cutoff, "dryRun": dry_run},
+                      timeout=180)
+    if "error" in response:
+        raise RuntimeError(response["error"].get("message", "bridge/tidy-archive falló"))
+    status = (response.get("result") or {}).get("status")
+    labels = {"archived": "ARCHIVED", "reconciled": "RECONCILED", "would_archive": "WOULD ARCHIVE"}
+    if status not in (*labels, "skipped"):
+        raise RuntimeError("bridge/tidy-archive no confirmó el resultado")
+    if not silent and status in labels:
+        print(f"{labels[status]} {tid}")
+    return status
+
+
+def cmd_tidy(c, a, silent=False, lock=None):
+    """Archiva únicamente los hilos presentes en threads.json y que ya estén inactivos."""
+    silent = silent or getattr(a, "quiet", False)
+    own_lock = lock is None
+    lock = lock or _tidy_lock()
+    if lock is None:
+        return 0
+    try:
+        records = load_threads()
+        if not isinstance(records, dict):
+            records = {}
+        tids = [tid for tid, record in records.items()
+                if isinstance(record, dict) and (record.get("archive_uncertain") or not record.get("archived_at"))]
+        cutoff = time.time() - tidy_hours(getattr(a, "hours", None)) * 3600
+        archived = skipped = failed = 0
+        listed = {}
+        cursor = None
+        seen_cursors = set()
+        while tids:
+            try:
+                params = {"limit": min(100, max(1, len(tids))), "archived": False}
+                if cursor:
+                    params["cursor"] = cursor
+                response = c.call("thread/list", params, timeout=60)
+                if "error" in response:
+                    _tidy_warn("*", response["error"].get("message", "thread/list falló"), silent)
+                    break
+                page = _thread_list(response)
+                listed.update({thread.get("id"): thread for thread in page if thread.get("id")})
+                if len(listed) >= len(tids):
+                    break
+                result = response.get("result") or {}
+                next_cursor = result.get("nextCursor") or response.get("nextCursor")
+                if not next_cursor or next_cursor in seen_cursors:
+                    break
+                seen_cursors.add(next_cursor)
+                cursor = next_cursor
+            except Exception as exc:
+                _tidy_warn("*", compact_error(exc), silent)
+                break
+
+        reconciled = 0
+        for tid in tids:
+            try:
+                result = _tidy_one(c, tid, cutoff, a.dry_run, silent)
+                if result == "archived":
+                    archived += 1
+                elif result == "reconciled":
+                    reconciled += 1
+                else:
+                    skipped += 1
+            except Exception as exc:
+                failed += 1
+                _tidy_warn(tid, compact_error(exc), silent)
+                # El autotidy corre con --quiet: sin esta línea los fallos no dejan rastro.
+                append(LOG, {"event": "tidy_failed", "thread": tid, "error": compact_error(exc)})
+        if not silent:
+            print(f"TIDY archived={archived} reconciled={reconciled} skipped={skipped} failed={failed}")
+        return 1 if failed else 0
+    finally:
+        if own_lock:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            os.close(lock)
+
+
+def cmd_keep(a, keep):
+    lock = _thread_lock()
+    try:
+        records = load_threads()
+        if not isinstance(records, dict) or a.thread not in records:
+            emit(f"FAILED: {a.thread} no está en threads.json; no se modifica ningún hilo")
+            return 5
+        if records[a.thread].get("archive_uncertain"):
+            try:
+                _reconcile_archive(Client(), a.thread, records)
+            except (Exception, SystemExit) as exc:
+                emit(f"FAILED: {a.thread} archive incierto: {compact_error(exc)}")
+                return 5
+        if records[a.thread].get("archived_at"):
+            emit(f"FAILED: {a.thread} ya está archivado; keep/unkeep no lo reabre")
+            return 5
+        records[a.thread]["keep"] = keep
+        _write_threads(records)
+    finally:
+        _release_thread_lock(lock)
+    emit(f"OK {'keep' if keep else 'unkeep'} {a.thread}")
+    return 0
+
+
 def cmd_simple(c, a):
     m = {"rename": ("thread/name/set", {"threadId": a.thread, "name": getattr(a, "name", None)}),
          "archive": ("thread/archive", {"threadId": a.thread}),
          "unarchive": ("thread/unarchive", {"threadId": a.thread}),
          "fork": ("thread/fork", {"threadId": a.thread})}[a.cmd]
-    r = ok(call_held(c, *m), m[0])
+    lock = _thread_lock() if a.cmd == "unarchive" else None
+    try:
+        r = ok(call_held(c, *m), m[0])
+        if a.cmd == "unarchive":
+            _clear_archived_locked(a.thread)
+    finally:
+        if lock is not None:
+            _release_thread_lock(lock)
     new = ((r or {}).get("thread") or {}).get("id")
+    if a.cmd == "fork" and new and a.thread in load_threads():
+        parent = dict(load_threads()[a.thread])
+        parent.pop("archived_at", None)
+        parent["forked_from"] = a.thread
+        save_thread(new, **parent)
     emit(f"OK {a.cmd} {a.thread}" + (f" -> {new}" if new else ""))
     return 0
 
@@ -916,7 +1928,17 @@ def cmd_mcp_call(c, a):
 
 
 def cmd_rpc(c, a):
-    print(json.dumps(c.call(a.method, json.loads(a.params or "{}"), timeout=120), indent=1))
+    params = json.loads(a.params or "{}")
+    reopening = a.method == "thread/unarchive" and params.get("threadId")
+    lock = _thread_lock() if reopening else None
+    try:
+        response = c.call(a.method, params, timeout=120)
+        if reopening and "result" in response and "error" not in response:
+            _clear_archived_locked(params["threadId"])
+    finally:
+        if lock is not None:
+            _release_thread_lock(lock)
+    print(json.dumps(response, indent=1))
     return 0
 
 
@@ -1027,10 +2049,221 @@ def cmd_claude_read(a):
     return 0
 
 
+ANSI_ESCAPE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+BACKGROUND_ID = re.compile(r"backgrounded\s*[·•]\s*([0-9a-fA-F]+)\s*[·•]", re.IGNORECASE)
+REMOTE_URL = re.compile(r"https://claude\.ai/code/session_[A-Za-z0-9_-]+")
+REMOTE_CONTROL_TIMEOUT = 20
+REMOTE_CONTROL_POLL = 0.5
+
+
+def strip_ansi(value):
+    """Elimina secuencias ANSI antes de analizar la salida de la CLI."""
+    return ANSI_ESCAPE.sub("", value or "")
+
+
+def parse_backgrounded_id(output):
+    """Devuelve el identificador corto que imprime ``claude --bg``."""
+    match = BACKGROUND_ID.search(strip_ansi(output))
+    return match.group(1) if match else None
+
+
+def claude_agents_all():
+    """Consulta todas las sesiones sin leer estado privado de Claude a mano."""
+    try:
+        result = subprocess.run(["claude", "agents", "--json", "--all"],
+                                capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"claude agents no respondió: {exc}") from exc
+    if result.returncode:
+        detail = (result.stderr or result.stdout or "sin salida").strip()
+        raise RuntimeError(f"claude agents falló ({result.returncode}): {detail}")
+    try:
+        data = json.loads(result.stdout or "[]")
+    except ValueError as exc:
+        raise RuntimeError(f"claude agents devolvió JSON inválido: {exc}") from exc
+    if isinstance(data, dict):
+        data = data.get("sessions") or data.get("data") or []
+    if not isinstance(data, list):
+        raise RuntimeError("claude agents no devolvió una lista de sesiones")
+    return data
+
+
+def session_for_short_id(rows, short_id):
+    """Encuentra la fila de ``claude agents`` correspondiente al id corto."""
+    return next((row for row in rows if str(row.get("id", "")) == short_id), None)
+
+
+def remote_control_url(short_id, timeout=REMOTE_CONTROL_TIMEOUT):
+    """Sondea los logs durante un tiempo limitado hasta que Remote Control esté activo."""
+    deadline = time.monotonic() + max(0, timeout)
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining < 0:
+            return None
+        try:
+            result = subprocess.run(["claude", "logs", short_id], capture_output=True, text=True,
+                                    timeout=max(0.1, min(5, remaining)))
+            match = REMOTE_URL.search(strip_ansi((result.stdout or "") + "\n" + (result.stderr or "")))
+            if match:
+                return match.group(0)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        time.sleep(min(REMOTE_CONTROL_POLL, remaining))
+
+
+def started_log_path():
+    return HOME / "claude-started.jsonl"
+
+
+def append_started(record):
+    """Añade un registro completo en una sola escritura, con permisos de usuario."""
+    HOME.mkdir(parents=True, exist_ok=True)
+    data = (json.dumps(record, ensure_ascii=False) + "\n").encode()
+    fd = os.open(started_log_path(), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    try:
+        written = os.write(fd, data)
+        if written != len(data):
+            raise OSError(f"escritura parcial de claude-started.jsonl: {written}/{len(data)} bytes")
+    finally:
+        os.close(fd)
+
+
+def read_started():
+    records = []
+    try:
+        lines = started_log_path().read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return records
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(record, dict):
+            records.append(record)
+    return records
+
+
+def claude_state(row):
+    """Normaliza los estados que imprime ``claude agents`` al contrato del bridge."""
+    values = {str(row.get(key, "")).lower() for key in ("status", "state")}
+    if values & {"running", "active", "connecting", "working", "in_progress"}:
+        return "running"
+    if values & {"completed", "complete", "done", "exited", "stopped", "failed", "error"}:
+        return "completed"
+    return "unknown"
+
+
+def session_row(record, rows):
+    row = session_for_short_id(rows, str(record.get("short_id", "")))
+    if row is None and record.get("session_id"):
+        row = next((item for item in rows if item.get("sessionId") == record["session_id"]), None)
+    return row
+
+
+def session_state(record, rows):
+    row = session_row(record, rows)
+    return claude_state(row) if row else "unknown"
+
+
+def resume_command(session_id):
+    return f"claude --resume {session_id}" if session_id else "pending"
+
+
+def default_claude_name(thread):
+    return f"codex {datetime.now().strftime('%H:%M')} {(thread or 'none')[:4]}"
+
+
+def notify_started(name, remote_url):
+    """Envía una notificación opcional sin convertirla en requisito de arranque."""
+    url = remote_url or "-"
+    text = f"{name} · {url}"
+
+    def apple_string(value):
+        return '"' + value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ") + '"'
+
+    script = f"display notification {apple_string(text)} with title {apple_string('Codex → Claude')}"
+    result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=10)
+    if result.returncode:
+        detail = (result.stderr or result.stdout or "sin detalle").strip()
+        print(f"WARNING: no se pudo mostrar la notificación: {detail}", file=sys.stderr)
+
+
 def cmd_claude_start(a):
-    r = subprocess.run(["claude", "--bg", a.prompt], cwd=a.cwd, capture_output=True, text=True, timeout=60)
-    print((r.stdout + r.stderr).strip())
-    return r.returncode
+    name = a.name or default_claude_name(a.thread)
+    command = ["claude", "--bg", f"--name={name}"]
+    if a.remote_control:
+        command += [f"--remote-control={name}"]
+    command += ["--", a.prompt]
+    result = subprocess.run(command, cwd=a.cwd, capture_output=True, text=True, timeout=60)
+    output = ((result.stdout or "") + (result.stderr or "")).strip()
+    if output:
+        print(output)
+    if result.returncode:
+        print(f"ERROR: claude --bg terminó con código {result.returncode}", file=sys.stderr)
+        return result.returncode
+    short_id = parse_backgrounded_id(output)
+    if not short_id:
+        print("ERROR: claude --bg no devolvió un id corto en una línea 'backgrounded · <id> · <name>'. "
+              f"Salida: {output or '(vacía)'}", file=sys.stderr)
+        return 5
+
+    try:
+        rows = claude_agents_all()
+    except Exception as exc:
+        rows = []
+        print(f"WARNING: no se pudo resolver sessionId con claude agents: {exc}", file=sys.stderr)
+    row = session_for_short_id(rows, short_id)
+    session_id = row.get("sessionId") if row else None
+    if not session_id:
+        print(f"WARNING: claude agents no contiene todavía el id {short_id}; resume queda pendiente.", file=sys.stderr)
+
+    url = remote_control_url(short_id) if a.remote_control else None
+    if a.remote_control and not url:
+        print(f"WARNING: Remote Control no publicó URL para {short_id} dentro de {REMOTE_CONTROL_TIMEOUT} s.",
+              file=sys.stderr)
+    record = {
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "short_id": short_id,
+        "session_id": session_id,
+        "name": name,
+        "cwd": str(Path(a.cwd).resolve()),
+        "from_thread": a.thread,
+        "remote_url": url,
+    }
+    append_started(record)
+    if a.notify:
+        try:
+            notify_started(name, url)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            print(f"WARNING: no se pudo mostrar la notificación: {exc}", file=sys.stderr)
+    print(f"CLAUDE-STARTED {short_id} name={name} url={url or '-'} "
+          f"resume=\"{resume_command(session_id)}\" from=codex://threads/{a.thread or '-'}")
+    return 0
+
+
+def cmd_claude_started(a):
+    records = read_started()
+    if a.last is not None:
+        records = records[-a.last:] if a.last > 0 else []
+    try:
+        rows = claude_agents_all()
+    except (OSError, RuntimeError) as exc:
+        rows = []
+        print(f"WARNING: no se pudo consultar el estado actual: {exc}", file=sys.stderr)
+    for record in records:
+        short_id = record.get("short_id", "-")
+        url = record.get("remote_url") or "-"
+        row = session_row(record, rows)
+        session_id = record.get("session_id") or (row or {}).get("sessionId")
+        print(f"{session_state(record, rows):<9} {record.get('name', '-')} "
+              f"id={short_id} session_id={session_id or '-'} "
+              f"url={url} resume=\"{resume_command(session_id)}\" "
+              f"cwd={record.get('cwd', '-')}")
+    return 0
 
 
 def cmd_doctor(a):
@@ -1082,9 +2315,18 @@ def main():
     E = ["minimal", "low", "medium", "high", "xhigh"]
 
     p = sub.add_parser("start"); p.add_argument("prompt"); p.add_argument("--title"); p.add_argument("--section")
-    p.add_argument("--cwd", default=str(Path.home()))
-    p.add_argument("--from", dest="sender", default=os.environ.get("CLAUDE_CODE_HOST_SESSION_ID"))
-    p.add_argument("--model"); p.add_argument("--effort", choices=E); p.add_argument("--timeout", type=int, default=3300)
+    p.add_argument("--role", required=True)
+    p.add_argument("--cwd", required=True)
+    # Dueño del hilo: sin él, nadie sabe a quién despertar cuando Codex termina.
+    p.add_argument("--from", dest="sender", default=os.environ.get("CLAUDE_CODE_HOST_SESSION_ID")
+                   or os.environ.get("CLAUDE_CODE_SESSION_ID"))
+    p.add_argument("--agent", default=os.environ.get("CLAUDE_CODEX_BRIDGE_AGENT"),
+                   help="nombre del subagente que espera el resultado (p. ej. noche-galeria)")
+    sandbox = p.add_mutually_exclusive_group()
+    sandbox.add_argument("--sandbox", choices=("workspace-write", "read-only"))
+    sandbox.add_argument("--full-access", action="store_true")
+    p.add_argument("--no-network", action="store_true")
+    p.add_argument("--timeout", type=int, default=3300)
     p.add_argument("--no-watch", action="store_true")
     p = sub.add_parser("send"); p.add_argument("thread"); p.add_argument("prompt"); p.add_argument("--model")
     p.add_argument("--effort", choices=E); p.add_argument("--timeout", type=int, default=3300)
@@ -1093,6 +2335,13 @@ def main():
     p.add_argument("--from-start", action="store_true")
     p = sub.add_parser("steer"); p.add_argument("thread"); p.add_argument("text")
     p = sub.add_parser("stop"); p.add_argument("thread")
+    p = sub.add_parser("tidy")
+    p.add_argument("--hours", type=float, default=None,
+                   help=f"horas de inactividad (por defecto {DEFAULT_TIDY_HOURS}; entorno {TIDY_HOURS_ENV})")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--quiet", action="store_true")
+    p = sub.add_parser("keep"); p.add_argument("thread")
+    p = sub.add_parser("unkeep"); p.add_argument("thread")
     p = sub.add_parser("list"); p.add_argument("--limit", type=int, default=25); p.add_argument("--search")
     p.add_argument("--archived", action="store_true")
     p = sub.add_parser("read"); p.add_argument("thread"); p.add_argument("--turns", type=int, default=2)
@@ -1114,6 +2363,14 @@ def main():
     p = sub.add_parser("to-claude"); p.add_argument("--to", required=True); p.add_argument("message"); p.add_argument("--thread")
     p = sub.add_parser("relay"); p.add_argument("--minutes", type=int, default=55); p.add_argument("--name", default="default")
     p = sub.add_parser("claude-start"); p.add_argument("prompt"); p.add_argument("--cwd", default=str(Path.home()))
+    p.add_argument("--name", default=None)
+    p.add_argument("--remote-control", dest="remote_control", action="store_true", default=True)
+    p.add_argument("--no-remote-control", dest="remote_control", action="store_false")
+    p.add_argument("--thread", default=os.environ.get("CODEX_THREAD_ID"))
+    p.add_argument("--notify", action="store_true")
+    p = sub.add_parser("claude-started"); p.add_argument("--last", type=int, default=None)
+    p = sub.add_parser("finished"); p.add_argument("--hours", type=float, default=24)
+    p.add_argument("--owner"); p.add_argument("--unread", action="store_true"); p.add_argument("--json", action="store_true")
     p = sub.add_parser("claude-read"); p.add_argument("session"); p.add_argument("--last", type=int, default=4)
     for n in ("serve", "up", "ping"):
         sub.add_parser(n)
@@ -1143,9 +2400,24 @@ def main():
         print("down"); return 0
     if a.cmd == "app-connect":
         return cmd_app_connect(a)
-    local = {"claude-read": cmd_claude_read, "claude-list": cmd_claude_list, "to-claude": cmd_to_claude, "relay": cmd_relay, "claude-start": cmd_claude_start}
+    local = {"claude-read": cmd_claude_read, "claude-list": cmd_claude_list, "to-claude": cmd_to_claude,
+             "relay": cmd_relay, "claude-start": cmd_claude_start, "claude-started": cmd_claude_started,
+             "finished": cmd_finished}
     if a.cmd in local:
         return local[a.cmd](a)
+    if a.cmd == "keep":
+        return cmd_keep(a, True)
+    if a.cmd == "unkeep":
+        return cmd_keep(a, False)
+    if a.cmd == "tidy":
+        lock = _tidy_lock()
+        if lock is None:
+            return 0
+        try:
+            return cmd_tidy(Client(), a, lock=lock)
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            os.close(lock)
     c = Client()
     if a.cmd == "sections":
         for s in sections(c):
@@ -1154,6 +2426,7 @@ def main():
     if a.cmd == "move":
         return move(c, a.thread, a.section)
     return {"start": cmd_start, "send": cmd_send, "watch": cmd_watch, "steer": cmd_steer, "stop": cmd_stop,
+            "tidy": cmd_tidy,
             "list": cmd_list, "read": cmd_read, "status": cmd_status, "rename": cmd_simple, "archive": cmd_simple,
             "unarchive": cmd_simple, "fork": cmd_simple, "settings": cmd_settings, "queue": cmd_queue,
             "goal": cmd_goal, "models": cmd_models, "mcp": cmd_mcp, "mcp-call": cmd_mcp_call, "rpc": cmd_rpc}[a.cmd](c, a)
