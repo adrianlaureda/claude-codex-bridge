@@ -53,6 +53,14 @@ La conciliación contrasta `thread/read` con los rollouts de `archived_sessions`
 | Cualquier otro método | `rpc <method> '{params}'`: todos los métodos del app-server |
 | Comprobar una actualización | `/usr/bin/python3 $B doctor [--verbose]`: read-only; informa `{ok, missing, codex_version, daemon}` y no inicia daemon ni turno |
 
+### Lease y relevo de supervisión
+
+`version` consulta al daemon activo sin abrir un turno de modelo y devuelve su versión, hash de código, PID e inicio. `ping` incluye el mismo recibo.
+
+Los comandos `send`, `steer` y `stop` aceptan `--owner <sessionId> --generation <n>`; por defecto toman la sesión de `CLAUDE_CODE_HOST_SESSION_ID` o `CLAUDE_CODE_SESSION_ID` y generación `1`. Para consultar la lease: `owner <thread>`. El propietario actual ofrece un relevo con `handoff-offer <thread> <nuevo-owner> --owner <actual> --generation <n>`. El entrante acepta el identificador devuelto con `handoff-accept <thread> <handoffId> --owner <nuevo-owner> --generation <n>`. La aceptación incrementa la generación; desde entonces el propietario anterior no puede enviar, dirigir ni detener turnos. Comprueba `owner` después de un timeout antes de repetir el relevo.
+
+Las mutaciones aceptan `--request-id <id>` para deduplicar reintentos. Si hay timeout, consulta `request <id>` antes de repetir: un recibo `complete` devuelve el resultado mínimo guardado y `started` o `uncertain` exige reconciliar el turno o la cola. No se guardan prompts ni respuestas en el journal.
+
 Desde `start`, las respuestas vuelven a esta sesión (`--from` toma por defecto su identificador: `CLAUDE_CODE_HOST_SESSION_ID` o, si falta, `CLAUDE_CODE_SESSION_ID`; `--agent` o `CLAUDE_CODEX_BRIDGE_AGENT` guarda el subagente que espera). `watch` y `read` anotan en `threads.json` cuándo se leyó el final del turno. Los nuevos hilos aparecen en la barra lateral de ChatGPT en su refresco de un minuto. Usa el enlace `codex://threads/<id>` de la línea `THREAD`.
 
 El estado es único por hilo: `running`, `done_unread`, `done_read`, `failed` o `waiting_input`. Incluye `last_changed_at` (UTC, ISO 8601), que solo cambia al cambiar el estado o el turno, y el id del último turno. Un turno activo o un envío registrado en cola mantiene el hilo como `running`; así un final anterior no despierta al vigilante. El bridge registra `clientUserMessageId` antes de `thread/queue/add` y retira el envío solo al encontrar el mismo `clientId` en el `UserMessage` del turno. Nunca infieras consumo por texto o fecha. Los registros antiguos de cola sin ese ID se conservan en `running` hasta que se eliminen explícitamente. En `send_to_claude`, usa `wait_for_reply: true` solo si el turno debe esperar respuesta; usa `false` en avances y resultados finales. Por compatibilidad, un turno completado en un hilo antiguo sin esa bandera cuenta como final. Si falta evidencia fiable porque el rollout está truncado, el estado queda `running`.
