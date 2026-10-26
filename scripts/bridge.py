@@ -17,10 +17,12 @@ writes for every thread, so it streams app-held threads too.
 CLAUDE -> CODEX
   bridge.py start "prompt" --role ROLE --cwd D [--title T] [--from S] [--agent NAME] [--no-watch]
                      [--sandbox {workspace-write,read-only} | --full-access] [--no-network]
-  bridge.py send <thread> "prompt" [--model M] [--effort E] [--no-watch]   unheld: new turn; held: queued
+  bridge.py send <thread> "prompt" [--owner S] [--generation N] [--request-id ID] [--no-watch]
   bridge.py watch <thread> [--timeout S] [--from-start]   stream until the current turn ends
-  bridge.py steer <thread> "text"            add input to the running turn (bridge-held threads)
-  bridge.py stop <thread>                    interrupt the running turn (bridge-held threads)
+  bridge.py steer <thread> "text" [--owner S] [--generation N] [--request-id ID]
+  bridge.py stop <thread> [--owner S] [--generation N] [--request-id ID]
+  bridge.py owner <thread> | handoff-offer <thread> <next-owner> | handoff-accept <thread> <id>
+  bridge.py request <request-id>             inspect a timed-out mutation before retrying
   bridge.py tidy [--hours 8] [--dry-run] [--quiet]
                                              archive old registered, idle bridge threads
   bridge.py keep <thread> | unkeep <thread> protect or unprotect a registered thread from tidy
@@ -50,9 +52,9 @@ CODEX -> CLAUDE
   bridge.py claude-read <local_id|name|sessionId> [--last N]   recent messages from its transcript
 
 DAEMON
-  bridge.py up | down | ping
+  bridge.py up | down | ping | version
 """
-import argparse, fcntl, glob, json, math, os, queue, re, socket, socketserver, subprocess, sys, threading, time, uuid
+import argparse, fcntl, glob, hashlib, json, math, os, queue, re, socket, socketserver, stat, subprocess, sys, threading, time, uuid
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -67,6 +69,11 @@ LOG = HOME / "events.jsonl"
 SESSIONS = Path.home() / ".codex" / "sessions"
 ARCHIVED_SESSIONS = Path.home() / ".codex" / "archived_sessions"
 LOCKED = "already has an active writer"
+BRIDGE_VERSION = "1.1.0"
+DAEMON_CODE_HASH = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:16]
+OWNER_WRITES = {"turn/start", "turn/steer", "turn/interrupt", "thread/queue/add", "bridge/app-call"}
+IDEMPOTENT_WRITES = OWNER_WRITES
+REQUEST_JOURNAL = HOME / "requests.json"
 DEFAULT_TIDY_HOURS = 8
 TIDY_HOURS_ENV = "CLAUDE_CODEX_BRIDGE_TIDY_HOURS"
 TIDY_INTERVAL_SECONDS = 3600
@@ -154,9 +161,14 @@ def tail_lines(path, limit=4_000_000):
 
 def load_threads():
     try:
-        return json.loads(THREADS.read_text())
-    except Exception:
+        rows = json.loads(THREADS.read_text())
+    except FileNotFoundError:
         return {}
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"threads.json no se puede leer o está corrupto: {exc}") from exc
+    if not isinstance(rows, dict) or any(not isinstance(row, dict) for row in rows.values()):
+        raise ValueError("threads.json debe ser un objeto JSON de registros")
+    return rows
 
 
 def _remaining(deadline):
@@ -226,6 +238,116 @@ def reconcile_queue_entries(tid, consumed_ids):
         _write_threads(d)
     finally:
         _release_thread_lock(lock)
+
+
+def update_thread(tid, change, deadline=None, registry_locked=False):
+    """Actualiza una lease bajo el mismo lock entre procesos que protege el registro."""
+    lock = None if registry_locked else _thread_lock(deadline)
+    try:
+        rows = load_threads()
+        row = rows.get(tid)
+        if row is None:
+            return None
+        result = change(row)
+        _write_threads(rows)
+        return result
+    finally:
+        if lock is not None:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            os.close(lock)
+
+
+def request_record(request_id):
+    dir_fd = _private_state_dir()
+    try:
+        try:
+            fd = _open_private_file(dir_fd, REQUEST_JOURNAL.name, os.O_RDONLY)
+        except FileNotFoundError:
+            return None
+        with os.fdopen(fd, "r", encoding="utf-8") as journal:
+            rows = json.load(journal)
+    finally:
+        os.close(dir_fd)
+    if not isinstance(rows, dict):
+        raise ValueError("requests.json no contiene un objeto JSON")
+    record = rows.get(request_id)
+    if record is not None and not isinstance(record, dict):
+        raise ValueError("requests.json contiene un recibo inválido")
+    return record
+
+
+def request_fingerprint(params):
+    canonical = json.dumps(params, sort_keys=True, separators=(",", ":"),
+                           ensure_ascii=False, allow_nan=False).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def write_request_record(request_id, record):
+    """Guarda estados mínimos y duraderos; no persiste prompts ni respuestas completas."""
+    dir_fd = _private_state_dir()
+    try:
+        fd = _open_private_file(dir_fd, "requests.lock", os.O_RDWR | os.O_CREAT)
+    except BaseException:
+        os.close(dir_fd)
+        raise
+    temp_name = f"requests.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            try:
+                journal_fd = _open_private_file(dir_fd, REQUEST_JOURNAL.name, os.O_RDONLY)
+            except FileNotFoundError:
+                rows = {}
+            else:
+                with os.fdopen(journal_fd, "r", encoding="utf-8") as journal:
+                    rows = json.load(journal)
+        except FileNotFoundError:
+            rows = {}
+        if not isinstance(rows, dict):
+            raise ValueError("requests.json no contiene un objeto JSON")
+        rows[request_id] = record
+        temp_fd = os.open(temp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                          0o600, dir_fd=dir_fd)
+        os.fchmod(temp_fd, 0o600)
+        with os.fdopen(temp_fd, "w", encoding="utf-8") as temp_file:
+            json.dump(rows, temp_file, indent=1)
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+        os.replace(temp_name, REQUEST_JOURNAL.name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        os.fsync(dir_fd)
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+        try:
+            os.unlink(temp_name, dir_fd=dir_fd)
+        except FileNotFoundError:
+            pass
+        os.close(dir_fd)
+
+
+def _private_state_dir():
+    if REQUEST_JOURNAL.parent != HOME:
+        raise ValueError("requests.json debe estar dentro del directorio privado del bridge")
+    HOME.mkdir(parents=True, exist_ok=True, mode=0o700)
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    dir_fd = os.open(HOME, flags)
+    info = os.fstat(dir_fd)
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
+        os.close(dir_fd)
+        raise PermissionError("el directorio del bridge no es un directorio privado del usuario actual")
+    os.fchmod(dir_fd, 0o700)
+    return dir_fd
+
+
+def _open_private_file(dir_fd, name, flags):
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(name, flags, 0o600, dir_fd=dir_fd)
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_nlink != 1:
+        os.close(fd)
+        raise PermissionError(f"{name} debe ser un archivo regular privado del usuario actual")
+    os.fchmod(fd, 0o600)
+    return fd
 
 
 def mark_consumed(tid, turn_id=None, seen_at=None):
@@ -860,12 +982,15 @@ def handle_tool_call(o):
 # releases the lock and the ChatGPT app can open the thread again.
 WRITES = {"thread/start", "thread/fork", "thread/resume", "turn/start", "turn/steer", "turn/interrupt",
           "turn/settings/update", "thread/compact/start", "thread/shellCommand", "review/start",
-          "mcpServer/tool/call", "thread/inject_items", "thread/rollback", "thread/revert"}
+          "mcpServer/tool/call", "thread/inject_items", "thread/rollback", "thread/revert", "bridge/app-call"}
 IDLE_CLOSE = 5
 
 
 class Daemon:
     def __init__(self):
+        self.started_at = datetime.now().astimezone().isoformat(timespec="seconds")
+        self.request_locks = defaultdict(threading.Lock)
+        self.request_locks_guard = threading.Lock()
         self.mlock = threading.Lock()
         self._main = AppServer(on_request=handle_tool_call)  # reads and management, holds no locks
         self.workers = {}                      # threadId -> AppServer
@@ -984,14 +1109,24 @@ class Daemon:
 
     def rpc(self, method, params):
         params = dict(params)
+        if method == "bridge/app-call":
+            app_params = params.get("appParams")
+            outer_tid = params.get("threadId")
+            inner_tid = app_params.get("threadId") if isinstance(app_params, dict) else None
+            if not outer_tid or not inner_tid or outer_tid != inner_tid:
+                return {"error": {"message": "bridge/app-call exige el mismo threadId exterior e interior"}}
         deadline = min(params.get("_deadline", float("inf")),
                        time.monotonic() + params.get("_timeout", 60))
         _remaining(deadline)
         params["_deadline"] = deadline
         tid = params.get("threadId")
-        # Solo tidy posee aquí el registro: siempre threads.lock → cycle_lock.
-        # send/watch ya protegen su reapertura con threads.lock en el cliente.
-        registry_lock = _thread_lock(deadline) if method == "bridge/tidy-archive" else None
+        if method in OWNER_WRITES or method == "bridge/handoff/offer":
+            denied = self._check_owner(params, deadline=deadline, allow_claim=True)
+            if "error" in denied:
+                return denied
+        registry_lock = _thread_lock(deadline) if method in (
+            "bridge/tidy-archive", "bridge/owner/check", "bridge/handoff/offer", "bridge/handoff/accept") else None
+        params["_registry_lock_held"] = registry_lock is not None
         try:
             if tid:
                 cycle = self.cycle_locks[tid]
@@ -1012,8 +1147,210 @@ class Daemon:
                 _release_thread_lock(registry_lock)
 
     def _rpc(self, method, params):
+        params = dict(params)
+        registry_lock_held = params.pop("_registry_lock_held", False)
+        request_id = params.pop("_request_id", None)
         deadline = params.pop("_deadline")
         timeout = min(params.pop("_timeout", 60), _remaining(deadline))
+        if method == "bridge/ping":
+            return {"result": {"pid": os.getpid(), "running": self.running, "workers": list(self.workers),
+                               "daemonVersion": BRIDGE_VERSION, "codeHash": DAEMON_CODE_HASH,
+                               "startedAt": getattr(self, "started_at", None)}}
+        if method == "bridge/version":
+            return {"result": {"daemonVersion": BRIDGE_VERSION, "codeHash": DAEMON_CODE_HASH,
+                               "pid": os.getpid(), "startedAt": getattr(self, "started_at", None)}}
+        if method == "bridge/request/status":
+            record = request_record(params.get("requestId", ""))
+            if not record:
+                return {"result": {"status": "unknown", "requestId": params.get("requestId")}}
+            return {"result": {"requestId": params.get("requestId"), **record}}
+        if method == "bridge/owner/read":
+            row = load_threads().get(params.get("threadId"))
+            if not row or not row.get("owner"):
+                return {"error": {"message": "el hilo no tiene propietario registrado"}}
+            return {"result": {"threadId": params["threadId"], "owner": row["owner"],
+                               "generation": row.get("owner_generation", 1),
+                               "pendingOwner": row.get("pending_owner"), "handoffId": row.get("handoff_id")}}
+        if method == "bridge/owner/check":
+            return self._check_owner(params, deadline=deadline, allow_claim=True,
+                                      registry_locked=registry_lock_held)
+        if method == "bridge/handoff/offer":
+            denied = self._check_owner(params, deadline=deadline, allow_claim=False)
+            if "error" in denied:
+                return denied
+            next_owner = params.get("nextOwner")
+            if not isinstance(next_owner, str) or not next_owner.strip():
+                return {"error": {"message": "nextOwner debe identificar al supervisor entrante"}}
+            handoff_id = uuid.uuid4().hex
+            def offer(row):
+                if (params.get("owner") != row.get("owner") or
+                        params.get("generation") != row.get("owner_generation")):
+                    return {"error": {"message": "propietario o generación revocados; reconcilia antes de repetir"}}
+                row["pending_owner"] = next_owner.strip()
+                row["pending_generation"] = row.get("owner_generation", 1) + 1
+                row["handoff_id"] = handoff_id
+                return {"result": {"threadId": params["threadId"], "handoffId": handoff_id,
+                        "owner": row["owner"], "generation": row["owner_generation"],
+                        "pendingOwner": row["pending_owner"], "pendingGeneration": row["pending_generation"]}}
+            result = update_thread(params["threadId"], offer, deadline=deadline,
+                                   registry_locked=registry_lock_held)
+            return result if result else {"error": {"message": "hilo no registrado"}}
+        if method == "bridge/handoff/accept":
+            accepted = {"value": None}
+            def accept(row):
+                if (row.get("pending_owner") != params.get("owner") or
+                        row.get("handoff_id") != params.get("handoffId") or
+                        row.get("owner_generation", 1) != params.get("generation")):
+                    return None
+                row["owner"] = row.pop("pending_owner")
+                row["owner_generation"] = row.pop("pending_generation")
+                row.pop("handoff_id", None)
+                accepted["value"] = {"threadId": params["threadId"], "owner": row["owner"],
+                                      "generation": row["owner_generation"]}
+                return accepted["value"]
+            result = update_thread(params.get("threadId"), accept, deadline=deadline,
+                                   registry_locked=registry_lock_held)
+            if not result:
+                return {"error": {"message": "handoff no disponible; reconcilia el estado antes de repetir"}}
+            return {"result": result}
+
+        if method in OWNER_WRITES:
+            denied = self._check_owner(params, deadline=deadline, allow_claim=False)
+            if "error" in denied:
+                return denied
+        dispatch_params = dict(params)
+        dispatch_params.pop("owner", None)
+        dispatch_params.pop("generation", None)
+        if method == "bridge/app-call":
+            app_params = dict(dispatch_params.get("appParams") or {})
+            if app_params.get("threadId") != params.get("threadId"):
+                return {"error": {"message": "bridge/app-call threadId no coincide"}}
+            for key in ("owner", "generation", "_request_id"):
+                app_params.pop(key, None)
+            dispatch_params["appParams"] = app_params
+        if request_id and method in IDEMPOTENT_WRITES:
+            action = method
+            if method == "bridge/app-call":
+                action = f"{method}:{params.get('appMethod', '')}"
+            fingerprint = request_fingerprint(dispatch_params)
+            with self.request_locks_guard:
+                request_lock = self.request_locks[request_id]
+            with request_lock:
+                previous = request_record(request_id)
+                if previous:
+                    previous_action = previous.get("action", previous.get("method"))
+                    if (previous_action != action or previous.get("threadId") != params.get("threadId") or
+                            previous.get("owner") != params.get("owner") or
+                            previous.get("generation") != params.get("generation")):
+                        return {"error": {"message": "requestId ya pertenece a otra operación",
+                                          "requestId": request_id}}
+                    if previous.get("fingerprint") != fingerprint:
+                        return {"error": {"message": "requestId tiene otra huella; reconcilia antes de repetir",
+                                          "requestId": request_id}}
+                    if previous.get("status") == "complete":
+                        return previous["response"]
+                    return {"error": {"message": "resultado incierto; reconcilia antes de repetir",
+                                      "requestId": request_id, "status": previous.get("status")}}
+                write_request_record(request_id, {"status": "started", "method": method,
+                                                  "action": action, "threadId": params.get("threadId"),
+                                                  "fingerprint": fingerprint,
+                                                  "owner": params.get("owner"),
+                                                  "generation": params.get("generation")})
+                self._active_request_id = request_id
+                try:
+                    response = self._dispatch(method, dispatch_params, timeout, deadline)
+                except Exception as exc:
+                    uncertain = {"status": "uncertain", "method": method, "action": action,
+                                 "threadId": params.get("threadId"), "owner": params.get("owner"),
+                                 "generation": params.get("generation"), "fingerprint": fingerprint}
+                    write_request_record(request_id, uncertain)
+                    return {"error": {"message": f"mutación sin resultado confirmado: {exc}",
+                                      "requestId": request_id, "status": "uncertain"}}
+                finally:
+                    self._active_request_id = None
+                if "error" in response:
+                    write_request_record(request_id, {"status": "uncertain", "method": method,
+                                                      "action": action, "threadId": params.get("threadId"),
+                                                      "fingerprint": fingerprint,
+                                                      "owner": params.get("owner"),
+                                                      "generation": params.get("generation")})
+                    response["error"].setdefault("requestId", request_id)
+                else:
+                    app_method = params.get("appMethod") if method == "bridge/app-call" else method
+                    result = response.get("result") or {}
+                    if app_method == "turn/start":
+                        receipt = {"result": {"turn": {"id": (result.get("turn") or {}).get("id")}}}
+                    elif method == "thread/queue/add":
+                        receipt = {"result": {"queuedSubmission": {
+                            "id": (result.get("queuedSubmission") or {}).get("id")}}}
+                    else:
+                        receipt = {"result": {"accepted": True}}
+                    write_request_record(request_id, {"status": "complete", "method": method,
+                                                      "action": action, "threadId": params.get("threadId"),
+                                                      "fingerprint": fingerprint,
+                                                      "owner": params.get("owner"),
+                                                      "generation": params.get("generation"),
+                                                      "response": receipt})
+                return response
+        return self._dispatch(method, dispatch_params, timeout, deadline)
+
+    def _check_owner(self, params, deadline=None, allow_claim=False, registry_locked=False):
+        tid = params.get("threadId")
+        row = load_threads().get(tid)
+        if not row:
+            owner = params.get("owner")
+            if not owner:
+                return {"result": {"status": "unmanaged"}}
+            if not tid or not isinstance(owner, str) or not owner.strip() or params.get("generation") != 1:
+                return {"error": {"message": "hilo sin lease; reclama con owner y generation 1"}}
+            if not allow_claim:
+                return {"error": {"message": "hilo sin lease; reconcilia antes de mutar"}}
+            lock = None if registry_locked else _thread_lock(deadline)
+            try:
+                rows = load_threads()
+                row = rows.get(tid)
+                if row is None:
+                    rows[tid] = {"owner": owner.strip(), "owner_generation": 1}
+                    _write_threads(rows)
+                    row = rows[tid]
+            finally:
+                if lock is not None:
+                    fcntl.flock(lock, fcntl.LOCK_UN)
+                    os.close(lock)
+            if row.get("owner") != owner.strip() or row.get("owner_generation", 1) != 1:
+                return {"error": {"message": "hilo reclamado por otro supervisor; reconcilia la lease"}}
+            return {"result": {"owner": owner.strip(), "generation": 1}}
+        if not row.get("owner"):
+            legacy_owner = row.get("from")
+            if not params.get("owner"):
+                return {"result": {"status": "unmanaged"}}
+            if not legacy_owner:
+                return {"error": {"message": "hilo registrado sin propietario; reconcilia su origen antes de mutar"}}
+            if params.get("owner") != legacy_owner or params.get("generation") != 1:
+                return {"error": {"message": "la lease antigua pertenece a otro supervisor; reconcilia antes de repetir"}}
+            if not allow_claim:
+                return {"error": {"message": "lease heredada sin migrar; reconcilia antes de mutar"}}
+            def migrate(current):
+                if not current.get("owner") and current.get("from") == legacy_owner:
+                    current["owner"] = legacy_owner
+                    current["owner_generation"] = 1
+            update_thread(tid, migrate, deadline=deadline, registry_locked=registry_locked)
+            return self._check_owner(params, deadline=deadline, allow_claim=False,
+                                     registry_locked=registry_locked)
+        if (params.get("owner") != row.get("owner") or
+                params.get("generation") != row.get("owner_generation", 1)):
+            return {"error": {"message": "propietario o generación revocados; reconcilia el lease antes de repetir",
+                               "owner": row.get("owner"), "generation": row.get("owner_generation", 1)}}
+        return {"result": {"owner": row["owner"], "generation": row.get("owner_generation", 1)}}
+
+    def _dispatch(self, method, params, timeout, deadline=None):
+        deadline = deadline if deadline is not None else time.monotonic() + timeout
+        if method == "bridge/app-call":
+            app_method = params.get("appMethod")
+            if app_method not in ("turn/start", "turn/steer", "turn/interrupt"):
+                return {"error": {"message": "método de app no permitido"}}
+            response = app_call(app_method, params.get("appParams") or {}, timeout=min(40, timeout))
+            return response or {"error": {"message": "sin respuesta confirmada de la app"}}
         if method == "bridge/tidy-archive":
             status = _tidy_registered(self, params["threadId"], params["cutoff"],
                                       params.get("dryRun", False), deadline)
@@ -1103,6 +1440,31 @@ class Daemon:
             self.touched[tid] = time.time()
 
 
+def make_server(daemon, socket_path=None):
+    class H(socketserver.StreamRequestHandler):
+        def handle(self):
+            req = None
+            for line in self.rfile:
+                try:
+                    req = json.loads(line)
+                    response = daemon.rpc(req["method"], req.get("params") or {})
+                except Exception as exc:
+                    method = req.get("method") if isinstance(req, dict) else None
+                    append(LOG, {"event": "rpc_error", "pid": os.getpid(), "method": method,
+                                 "error": compact_error(exc)})
+                    response = {"error": {"message": f"bridge: {exc}"}}
+                try:
+                    self.wfile.write((json.dumps(response) + "\n").encode())
+                    self.wfile.flush()
+                except OSError:
+                    break
+
+    class S(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+        daemon_threads = True
+
+    return S(str(socket_path or SOCK), H)
+
+
 def serve():
     HOME.mkdir(parents=True, exist_ok=True)
     # The daemon holds this lock for its whole life. Only the holder may remove the socket, so a
@@ -1149,11 +1511,12 @@ def serve():
 
 def ping():
     try:
-        c = socket.socket(socket.AF_UNIX)
-        c.settimeout(3)
-        c.connect(str(SOCK))
-        c.sendall(b'{"method":"bridge/ping"}\n')
-        return json.loads(c.makefile().readline())["result"]
+        with socket.socket(socket.AF_UNIX) as c:
+            c.settimeout(3)
+            c.connect(str(SOCK))
+            c.sendall(b'{"method":"bridge/ping"}\n')
+            with c.makefile() as reader:
+                return json.loads(reader.readline())["result"]
     except Exception:
         return None
 
@@ -1184,6 +1547,7 @@ class Client:
         self.c.settimeout(5)
         self.c.connect(str(SOCK))
         self.f = self.c.makefile()
+        self.response_grace = 15
 
     def call(self, method, params=None, timeout=60):
         params = dict(params or {})
@@ -1192,19 +1556,37 @@ class Client:
         deadline = params.pop("_deadline", None)
         if deadline is not None:
             timeout = min(timeout, _remaining(deadline))
+        request_id = params.pop("_request_id", None)
+        if method in IDEMPOTENT_WRITES:
+            request_id = request_id or uuid.uuid4().hex
+            params["_request_id"] = request_id
+        if method == "thread/queue/add" and request_id:
+            params["clientUserMessageId"] = uuid.uuid5(uuid.NAMESPACE_URL,
+                                                        f"bridge-queue:{request_id}").hex
         params["_timeout"] = timeout
-        self.c.settimeout(timeout + 15)  # a stuck daemon never hangs the command
+        self.c.settimeout(timeout + getattr(self, "response_grace", 15))  # un daemon bloqueado no deja colgado el comando
         try:
             self.c.sendall((json.dumps({"method": method, "params": params}) + "\n").encode())
             line = self.f.readline()
         except (socket.timeout, OSError) as e:
-            return {"error": {"message": f"bridge daemon did not answer {method}: {e}"}}
-        return json.loads(line) if line else {"error": {"message": "bridge daemon closed the connection"}}
+            error = {"message": f"bridge daemon did not answer {method}: {e}"}
+            if request_id:
+                error["requestId"] = request_id
+            result = {"error": error}
+            return result
+        if line:
+            return json.loads(line)
+        error = {"message": "bridge daemon closed the connection"}
+        if request_id:
+            error["requestId"] = request_id
+        return {"error": error}
 
 
 def ok(r, what):
     if "error" in r:
-        emit(f"FAILED: {what}: {r['error'].get('message')}")
+        request_id = r["error"].get("requestId")
+        suffix = f"; requestId={request_id} (reconcilia con `request {request_id}` antes de repetir)" if request_id else ""
+        emit(f"FAILED: {what}: {r['error'].get('message')}{suffix}")
         sys.exit(5)
     return r.get("result")
 
@@ -1403,6 +1785,30 @@ def turn_params(tid, text, a, policy=None, allow_overrides=True):
     return p
 
 
+def mutation_context(a):
+    """Añade la lease y la identidad de reintento elegidas por el supervisor."""
+    context = {}
+    owner = (getattr(a, "owner", None) or getattr(a, "sender", None) or
+             os.environ.get("CLAUDE_CODE_HOST_SESSION_ID") or os.environ.get("CLAUDE_CODE_SESSION_ID"))
+    generation = getattr(a, "generation", None)
+    request_id = getattr(a, "request_id", None)
+    if owner:
+        context["owner"] = owner
+    if generation is not None:
+        context["generation"] = generation
+    if request_id:
+        context["_request_id"] = request_id
+    return context
+
+
+def check_owner(c, a):
+    r = c.call("bridge/owner/check", {"threadId": a.thread, **mutation_context(a)})
+    if "error" in r:
+        emit(f"FAILED: {r['error'].get('message')}")
+        return False
+    return True
+
+
 def set_title(c, tid, title):
     """Name a new thread without failing the task. Right after turn/start the rollout file can still be
     empty, and Codex refuses the rename; the turn is already running, so a hard exit here ended the watch
@@ -1493,13 +1899,16 @@ def cmd_start(c, a):
         thread_params["config"] = config
     r = ok(c.call("thread/start", thread_params), "thread/start")
     tid = r["thread"]["id"]
-    policy = {"from": a.sender, "agent": getattr(a, "agent", None), "title": a.title, "role": a.role,
+    owner = getattr(a, "owner", None) or a.sender
+    policy = {"from": a.sender, "owner": owner, "owner_generation": getattr(a, "generation", 1),
+              "agent": getattr(a, "agent", None), "title": a.title, "role": a.role,
               "cwd": str(cwd), "sandbox": mode, "network_access": network_access, "model": route["model"],
               "effort": route["effort"]}
     save_thread(tid, **policy)
     emit(f"THREAD {tid} codex://threads/{tid}")
     append(LOG, {"event": "start", "thread": tid, "from": a.sender, "title": a.title})
-    turn = ok(c.call("turn/start", turn_params(tid, a.prompt, a, policy=policy, allow_overrides=False)),
+    turn = ok(c.call("turn/start", {**turn_params(tid, a.prompt, a, policy=policy, allow_overrides=False),
+                                     **mutation_context(a)}),
               "turn/start")["turn"]["id"]
     if a.title:
         set_title(c, tid, a.title)
@@ -1512,6 +1921,8 @@ def cmd_start(c, a):
 
 
 def cmd_send(c, a):
+    if not check_owner(c, a):
+        return 5
     lock = ensure_unarchived(c, a.thread)
     try:
         path = rollout_path(a.thread, wait=0)
@@ -1521,10 +1932,13 @@ def cmd_send(c, a):
                 if app_active_turn(a.thread):
                     emit("FAILED: a turn is running in the ChatGPT app. Use steer to add to it, or wait.")
                     return 5
-                r = app_call("turn/start", turn_params(a.thread, a.prompt, a))
+                app_params = turn_params(a.thread, a.prompt, a)
+                r = c.call("bridge/app-call", {"threadId": a.thread, "appMethod": "turn/start",
+                    "appParams": app_params, **mutation_context(a)})
                 if r and "error" in r and _archived_error(r):
                     _ensure_unarchived_locked(c, a.thread, force=True)
-                    r = app_call("turn/start", turn_params(a.thread, a.prompt, a))
+                    r = c.call("bridge/app-call", {"threadId": a.thread, "appMethod": "turn/start",
+                        "appParams": app_params, **mutation_context(a)})
                 if r and "result" in r:
                     turn = r["result"]["turn"]["id"]
                     emit(f"SENT {now()} to {a.thread} turn {turn} (through the ChatGPT app)")
@@ -1532,7 +1946,12 @@ def cmd_send(c, a):
                     _release_thread_lock(lock)
                     lock = None
                     return 0 if a.no_watch else watch(a.thread, a.timeout, path=path, offset=off, turn_id=turn)
-                emit(f"WARN: app route failed ({(r or {}).get('error', {}).get('message')}); queueing instead")
+                error = (r or {}).get("error", {})
+                request_id = error.get("requestId")
+                suffix = f"; requestId={request_id} (consulta `request {request_id}` antes de repetir)" if request_id else ""
+                emit(f"FAILED: app route did not confirm the mutation ({error.get('message')}); "
+                     f"reconcile request status before retrying or queueing{suffix}")
+                return 5
             meta = load_threads().get(a.thread, {})
             client_message_id = str(uuid.uuid4())
             intent_at = time.time()
@@ -1542,7 +1961,8 @@ def cmd_send(c, a):
             entries = list(meta.get("queued_entries") or []) + [intent]
             save_thread_locked(a.thread, queued_entries=entries, queued_updated_at=intent_at)
             response = c.call("thread/queue/add", {"threadId": a.thread, "clientUserMessageId": client_message_id,
-                                                    "input": [{"type": "text", "text": a.prompt}]})
+                                                    "input": [{"type": "text", "text": a.prompt}],
+                                                    **mutation_context(a)})
             error = response.get("error") if isinstance(response, dict) else None
             # Un código JSON-RPC confirma el rechazo; un error de transporte puede
             # llegar después de que el servidor haya aceptado y debe conservar la intención.
@@ -1573,10 +1993,10 @@ def cmd_send(c, a):
         if running:
             emit(f"FAILED: a turn is running ({running}). Use steer to add to it, or wait.")
             return 5
-        turn_response = c.call("turn/start", turn_params(a.thread, a.prompt, a))
+        turn_response = c.call("turn/start", {**turn_params(a.thread, a.prompt, a), **mutation_context(a)})
         if _archived_error(turn_response):
             _ensure_unarchived_locked(c, a.thread, force=True)
-            turn_response = c.call("turn/start", turn_params(a.thread, a.prompt, a))
+            turn_response = c.call("turn/start", {**turn_params(a.thread, a.prompt, a), **mutation_context(a)})
         turn = ok(turn_response, "turn/start")["turn"]["id"]
         emit(f"SENT {now()} to {a.thread} turn {turn}")
         append(LOG, {"event": "sent", "thread": a.thread, "turn": turn})
@@ -1652,15 +2072,21 @@ def app_turn_op(c, a, method, verb):
         return 5
     p = {"threadId": a.thread, "turnId": t} if method == "turn/interrupt" else \
         {"threadId": a.thread, "expectedTurnId": t, "input": [{"type": "text", "text": a.text}]}
-    r = app_call(method, p)
+    r = c.call("bridge/app-call", {"threadId": a.thread, "appMethod": method, "appParams": p,
+                                    **mutation_context(a)})
     if not r or "error" in r:
-        emit(f"FAILED: {method} through the app: {(r or {}).get('error', {}).get('message')}")
+        error = (r or {}).get("error", {})
+        request_id = error.get("requestId")
+        suffix = f"; requestId={request_id} (consulta `request {request_id}` antes de repetir)" if request_id else ""
+        emit(f"FAILED: {method} through the app: {error.get('message')}{suffix}")
         return 5
     emit(f"{verb} {now()} turn {t} (through the ChatGPT app)")
     return 0
 
 
 def cmd_steer(c, a):
+    if not check_owner(c, a):
+        return 5
     lock = ensure_unarchived(c, a.thread)
     try:
         r = app_turn_op(c, a, "turn/steer", "STEERED")
@@ -1670,7 +2096,8 @@ def cmd_steer(c, a):
         if not t:
             emit("FAILED: no running turn in this thread.")
             return 5
-        ok(c.call("turn/steer", {"threadId": a.thread, "expectedTurnId": t, "input": [{"type": "text", "text": a.text}]}),
+        ok(c.call("turn/steer", {"threadId": a.thread, "expectedTurnId": t,
+                                  "input": [{"type": "text", "text": a.text}], **mutation_context(a)}),
            "turn/steer")
         emit(f"STEERED {now()} turn {t}")
         return 0
@@ -1686,8 +2113,35 @@ def cmd_stop(c, a):
     if not t:
         emit("FAILED: no running turn in a thread this bridge writes.")
         return 5
-    ok(c.call("turn/interrupt", {"threadId": a.thread, "turnId": t}), "turn/interrupt")
+    ok(c.call("turn/interrupt", {"threadId": a.thread, "turnId": t, **mutation_context(a)}), "turn/interrupt")
     emit(f"STOPPED {now()} turn {t}")
+    return 0
+
+
+def cmd_owner(c, a):
+    r = ok(c.call("bridge/owner/read", {"threadId": a.thread}), "bridge/owner/read")
+    print(json.dumps(r, ensure_ascii=False))
+    return 0
+
+
+def cmd_handoff_offer(c, a):
+    params = {"threadId": a.thread, "nextOwner": a.next_owner, **mutation_context(a)}
+    r = ok(c.call("bridge/handoff/offer", params), "bridge/handoff/offer")
+    print(json.dumps(r, ensure_ascii=False))
+    return 0
+
+
+def cmd_handoff_accept(c, a):
+    params = {"threadId": a.thread, "owner": a.owner, "generation": a.generation,
+              "handoffId": a.handoff_id}
+    r = ok(c.call("bridge/handoff/accept", params), "bridge/handoff/accept")
+    print(json.dumps(r, ensure_ascii=False))
+    return 0
+
+
+def cmd_request(c, a):
+    r = ok(c.call("bridge/request/status", {"requestId": a.request_id}), "bridge/request/status")
+    print(json.dumps(r, ensure_ascii=False))
     return 0
 
 
@@ -2617,6 +3071,9 @@ def main():
     # Dueño del hilo: sin él, nadie sabe a quién despertar cuando Codex termina.
     p.add_argument("--from", dest="sender", default=os.environ.get("CLAUDE_CODE_HOST_SESSION_ID")
                    or os.environ.get("CLAUDE_CODE_SESSION_ID"))
+    p.add_argument("--owner", default=os.environ.get("CLAUDE_CODE_HOST_SESSION_ID")
+                   or os.environ.get("CLAUDE_CODE_SESSION_ID"))
+    p.add_argument("--generation", type=int, default=1)
     p.add_argument("--agent", default=os.environ.get("CLAUDE_CODEX_BRIDGE_AGENT"),
                    help="nombre del subagente que espera el resultado (p. ej. noche-galeria)")
     sandbox = p.add_mutually_exclusive_group()
@@ -2627,11 +3084,26 @@ def main():
     p.add_argument("--no-watch", action="store_true")
     p = sub.add_parser("send"); p.add_argument("thread"); p.add_argument("prompt"); p.add_argument("--model")
     p.add_argument("--effort", choices=E); p.add_argument("--timeout", type=int, default=3300)
+    p.add_argument("--owner", default=os.environ.get("CLAUDE_CODE_HOST_SESSION_ID")
+                   or os.environ.get("CLAUDE_CODE_SESSION_ID"))
+    p.add_argument("--generation", type=int, default=1); p.add_argument("--request-id")
     p.add_argument("--no-watch", action="store_true")
     p = sub.add_parser("watch"); p.add_argument("thread"); p.add_argument("--timeout", type=int, default=3300)
     p.add_argument("--from-start", action="store_true")
     p = sub.add_parser("steer"); p.add_argument("thread"); p.add_argument("text")
+    p.add_argument("--owner", default=os.environ.get("CLAUDE_CODE_HOST_SESSION_ID")
+                   or os.environ.get("CLAUDE_CODE_SESSION_ID"))
+    p.add_argument("--generation", type=int, default=1); p.add_argument("--request-id")
     p = sub.add_parser("stop"); p.add_argument("thread")
+    p.add_argument("--owner", default=os.environ.get("CLAUDE_CODE_HOST_SESSION_ID")
+                   or os.environ.get("CLAUDE_CODE_SESSION_ID"))
+    p.add_argument("--generation", type=int, default=1); p.add_argument("--request-id")
+    sub.add_parser("owner").add_argument("thread")
+    p = sub.add_parser("handoff-offer"); p.add_argument("thread"); p.add_argument("next_owner")
+    p.add_argument("--owner", required=True); p.add_argument("--generation", type=int, required=True)
+    p = sub.add_parser("handoff-accept"); p.add_argument("thread"); p.add_argument("handoff_id")
+    p.add_argument("--owner", required=True); p.add_argument("--generation", type=int, required=True)
+    sub.add_parser("request").add_argument("request_id")
     p = sub.add_parser("tidy")
     p.add_argument("--hours", type=float, default=None,
                    help=f"horas de inactividad (por defecto {DEFAULT_TIDY_HOURS}; entorno {TIDY_HOURS_ENV})")
@@ -2671,7 +3143,7 @@ def main():
     p.add_argument("--watch", action="store_true", help="espera hasta que cambie el estado de cualquier hilo")
     p.add_argument("--interval", type=float, default=0.5, help=argparse.SUPPRESS)
     p = sub.add_parser("claude-read"); p.add_argument("session"); p.add_argument("--last", type=int, default=4)
-    for n in ("serve", "up", "ping"):
+    for n in ("serve", "up", "ping", "version"):
         sub.add_parser(n)
     p = sub.add_parser("down"); p.add_argument("--force", action="store_true")
     p = sub.add_parser("app-connect"); p.add_argument("--force", action="store_true")
@@ -2686,6 +3158,13 @@ def main():
         up(); print(json.dumps(ping())); return 0
     if a.cmd == "ping":
         r = ping(); print(json.dumps(r) if r else "down"); return 0 if r else 1
+    if a.cmd == "version":
+        r = ping()
+        if not r:
+            print("down"); return 1
+        print(json.dumps({"daemonVersion": r.get("daemonVersion"), "codeHash": r.get("codeHash"),
+                          "pid": r.get("pid"),
+                          "startedAt": r.get("startedAt")}, ensure_ascii=False)); return 0
     if a.cmd == "down":
         r = ping()
         # Stopping the daemon interrupts every turn it is carrying (a restart to load new
@@ -2725,6 +3204,8 @@ def main():
     if a.cmd == "move":
         return move(c, a.thread, a.section)
     return {"start": cmd_start, "send": cmd_send, "watch": cmd_watch, "steer": cmd_steer, "stop": cmd_stop,
+            "owner": cmd_owner, "handoff-offer": cmd_handoff_offer, "handoff-accept": cmd_handoff_accept,
+            "request": cmd_request,
             "tidy": cmd_tidy,
             "list": cmd_list, "read": cmd_read, "status": cmd_status, "rename": cmd_simple, "archive": cmd_simple,
             "unarchive": cmd_simple, "fork": cmd_simple, "settings": cmd_settings, "queue": cmd_queue,
