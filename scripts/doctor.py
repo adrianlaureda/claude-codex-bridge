@@ -2,16 +2,16 @@
 """Read-only health check for bridge.py against the installed Codex app server.
 
 A ChatGPT update ships a new bundled codex binary, and app-server methods get renamed or
-dropped without notice. This finds every method and notification bridge.py depends on by
-reading its source (AST, so new commands are picked up without a list to maintain), asks the
-installed binary for its current JSON schema, and names each one that moved.
+dropped without notice. This extracts statically recognizable methods and notifications from bridge.py
+(AST, without executing its source), asks the installed binary for its current JSON schema,
+and names each missing dependency. Dynamic RPC names are outside this check.
 
 It never starts the daemon, never starts a turn and never writes a thread: the daemon check
 is the same socket ping `bridge.py ping` uses.
 
-  python3 doctor.py [--bridge PATH] [--codex PATH] [--json]
+  python3 doctor.py [--bridge PATH] [--codex PATH] [--verbose]
 Exit 0 when every relied-on method exists, 1 when any is missing, 2 when the schema could
-not be generated.
+not be generated or the source/schema could not be fully inspected.
 """
 import argparse, ast, json, os, subprocess, sys, tempfile
 from pathlib import Path
@@ -28,52 +28,154 @@ def _is_method(s):
     return isinstance(s, str) and "/" in s and " " not in s and not s.startswith(("/", ".", "~"))
 
 
+def _method_name(value):
+    return isinstance(value, str) and bool(value) and not any(c.isspace() for c in value)
+
+
+def _call_method(node, wrappers):
+    """Localiza el argumento de método sin ejecutar la fuente."""
+    if not isinstance(node, ast.Call):
+        return None
+    if isinstance(node.func, ast.Attribute) and node.func.attr == "call":
+        index, name = 0, "method"
+    elif isinstance(node.func, ast.Name) and node.func.id in wrappers:
+        index, name = wrappers[node.func.id]
+    else:
+        return None
+    if len(node.args) > index and not any(isinstance(a, ast.Starred) for a in node.args[:index + 1]):
+        return node.args[index]
+    return next((k.value for k in node.keywords if k.arg == name), None)
+
+
+def _reads_method(node):
+    if isinstance(node, ast.Subscript):
+        return isinstance(node.slice, ast.Constant) and node.slice.value == "method"
+    return (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "get" and node.args
+            and isinstance(node.args[0], ast.Constant) and node.args[0].value == "method")
+
+
+def _method_variables(fn):
+    names = set()
+    for node in ast.walk(fn):
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                pairs = [(target, node.value)]
+                if isinstance(target, (ast.Tuple, ast.List)) and isinstance(node.value, (ast.Tuple, ast.List)):
+                    pairs = zip(target.elts, node.value.elts)
+                for name, value in pairs:
+                    if isinstance(name, ast.Name) and _reads_method(value):
+                        names.add(name.id)
+    return names
+
+
 def relied_on(source):
-    """{'requests': set, 'notifications': set, 'server_requests': set, 'routing': set, 'substrings': set}"""
+    """Extrae dependencias estáticas; no evalúa Python ni resuelve llamadas dinámicas."""
     tree = ast.parse(source)
     out = {k: set() for k in ("requests", "notifications", "server_requests", "routing", "substrings")}
+    table_values = {value for n in ast.walk(tree) if isinstance(n, ast.Dict) for value in n.values}
+    functions = [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    # Sigue wrappers sencillos como call_held y _tidy_call, incluso encadenados.
+    wrappers = {}
+    changed = True
+    while changed:
+        changed = False
+        for fn in functions:
+            if fn.name in wrappers:
+                continue
+            args = [a.arg for a in fn.args.posonlyargs + fn.args.args]
+            for node in ast.walk(fn):
+                method = _call_method(node, wrappers)
+                if isinstance(method, ast.Name) and method.id in args:
+                    wrappers[fn.name] = (args.index(method.id), method.id)
+                    changed = True
+                    break
 
     for node in ast.walk(tree):
-        # x.call("method", ...) and c.call(*m) where m comes from a dict of ("method", params) tuples
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "call":
-            if node.args and isinstance(node.args[0], ast.Constant) and _is_method(node.args[0].value):
-                out["requests"].add(node.args[0].value)
-        if isinstance(node, ast.Tuple) and node.elts and isinstance(node.elts[0], ast.Constant) \
-                and _is_method(node.elts[0].value) and len(node.elts) == 2 and isinstance(node.elts[1], ast.Dict):
+        method = _call_method(node, wrappers)
+        if isinstance(method, ast.Constant) and _method_name(method.value):
+            out["requests"].add(method.value)
+        # Tablas de pares (método, parámetros), incluidos parámetros calculados.
+        if isinstance(node, ast.Tuple) and len(node.elts) == 2 and isinstance(node.elts[0], ast.Constant) \
+                and _is_method(node.elts[0].value) \
+                and (isinstance(node.elts[1], ast.Dict) or node in table_values):
             out["requests"].add(node.elts[0].value)
-        # WRITES = {...}: methods the daemon routes to a per-thread worker
-        if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "WRITES" for t in node.targets):
-            for e in getattr(node.value, "elts", []):
-                if isinstance(e, ast.Constant):
-                    out["routing"].add(e.value)
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if any(isinstance(t, ast.Name) and t.id == "WRITES" for t in targets):
+                for e in getattr(node.value, "elts", []):
+                    if isinstance(e, ast.Constant) and _method_name(e.value):
+                        out["routing"].add(e.value)
 
-    for fn in (n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)):
+    for fn in functions:
         kind = "notifications" if fn.name in NOTE_FUNCS else "server_requests" if fn.name in REQUEST_FUNCS else None
         if not kind:
             continue
+        method_vars = _method_variables(fn)
+
+        def is_method(value):
+            return _reads_method(value) or isinstance(value, ast.Name) and value.id in method_vars
+
         for node in ast.walk(fn):
-            if isinstance(node, ast.Compare):
-                for c in [node.left, *node.comparators]:
-                    if isinstance(c, ast.Constant) and _is_method(c.value):
-                        out[kind].add(c.value)
-                    # `"pproval" in m`: the bridge declines every approval request by substring
-                    if isinstance(c, ast.Constant) and isinstance(c.value, str) and isinstance(node.ops[0], ast.In) \
-                            and c is node.left and "/" not in c.value:
-                        out["substrings"].add(c.value)
+            if not isinstance(node, ast.Compare):
+                continue
+            for left, op, right in zip([node.left, *node.comparators], node.ops, node.comparators):
+                if not (is_method(left) or is_method(right)):
+                    continue
+                # Coincidencias parciales no equivalen a métodos literales.
+                if isinstance(op, (ast.In, ast.NotIn)) and isinstance(left, ast.Constant) and isinstance(left.value, str):
+                    if kind != "server_requests" or not left.value or isinstance(op, ast.NotIn):
+                        raise ValueError("Comparación parcial de método no reconocida en callback del servidor")
+                    out["substrings"].add(left.value)
+                    continue
+                for value in (left, right):
+                    values = value.elts if isinstance(value, (ast.Tuple, ast.List, ast.Set)) else [value]
+                    for literal in values:
+                        if isinstance(literal, ast.Constant) and _method_name(literal.value):
+                            out[kind].add(literal.value)
     out["requests"] = {m for m in out["requests"] if not m.startswith(INTERNAL)}
-    out["requests"].add("initialize")   # sent in AppServer.__init__ through self.call
+    out["requests"].add("initialize")
     return out
+
+
+def _validate_source(need):
+    # Una fuente vacía o recortada no demuestra compatibilidad. Estos son los
+    # puntos de entrada del bridge que este extractor sabe inspeccionar.
+    if not (need["requests"] - {"initialize"}) or not need["notifications"] \
+            or not (need["server_requests"] or need["substrings"]):
+        raise ValueError("Fuente incompleta o no reconocida: faltan peticiones o callbacks del servidor")
+
+
+def _validate_schema(schema):
+    if not isinstance(schema, dict):
+        raise ValueError("Schema inválido: se esperaba un mapa de categorías")
+    for kind in ("requests", "notifications", "server_requests", "client_notifications"):
+        values = schema.get(kind)
+        if not isinstance(values, (set, frozenset)) or not all(_method_name(m) for m in values):
+            raise ValueError(f"Schema incompleto o inválido: {kind}")
 
 
 def schema_methods(codex, outdir):
     r = subprocess.run(["perl", "-e", "alarm 60; exec @ARGV", codex, "app-server", "generate-json-schema",
                         "--experimental", "--out", outdir], capture_output=True, text=True, timeout=75)
     if r.returncode:
-        raise RuntimeError(f"generate-json-schema exited {r.returncode}: {(r.stderr or r.stdout).strip()[:300]}")
+        raise RuntimeError(f"generate-json-schema terminó con código {r.returncode}: {(r.stderr or r.stdout).strip()[:300]}")
 
     def enum(name):
         d = json.loads((Path(outdir) / name).read_text())
-        return {e for v in d.get("oneOf", []) for e in (v.get("properties", {}).get("method", {}).get("enum") or [])}
+        variants = d.get("oneOf") if isinstance(d, dict) else None
+        if not isinstance(variants, list) or not variants:
+            raise ValueError(f"Schema incompleto o no reconocido: {name}: oneOf")
+        methods = set()
+        for i, variant in enumerate(variants):
+            props = variant.get("properties") if isinstance(variant, dict) else None
+            method = props.get("method") if isinstance(props, dict) else None
+            values = method.get("enum") if isinstance(method, dict) else None
+            if not isinstance(values, list) or not values or not all(_method_name(m) for m in values):
+                raise ValueError(f"Schema incompleto o no reconocido: {name}: oneOf[{i}].method.enum")
+            methods.update(values)
+        return methods
 
     return {"requests": enum("ClientRequest.json"), "notifications": enum("ServerNotification.json"),
             "server_requests": enum("ServerRequest.json"), "client_notifications": enum("ClientNotification.json")}
@@ -83,7 +185,7 @@ def codex_version(codex):
     try:
         r = subprocess.run(["perl", "-e", "alarm 20; exec @ARGV", codex, "--version"],
                            capture_output=True, text=True, timeout=30)
-        return r.stdout.strip() or None
+        return (r.stdout.strip() or None) if r.returncode == 0 else None
     except Exception:
         return None
 
@@ -128,14 +230,16 @@ def _etime_seconds(s):
 
 def check(bridge_src, schema):
     need = relied_on(bridge_src)
+    _validate_source(need)
+    _validate_schema(schema)
     missing = sorted(
         [m for m in need["requests"] if m not in schema["requests"]]
         + [f"notification:{m}" for m in need["notifications"] if m not in schema["notifications"]]
         + [f"server-request:{m}" for m in need["server_requests"] if m not in schema["server_requests"]]
-        + ([] if "initialized" in schema.get("client_notifications", {"initialized"}) else ["notification:initialized"])
+        + ([] if "initialized" in schema["client_notifications"] else ["notification:initialized"])
         + [f"server-request~{s}" for s in need["substrings"] if not any(s in m for m in schema["server_requests"])])
     warnings = [f"WRITES routes {m}, which the app server no longer has (harmless unless something calls it)"
-                for m in sorted(need["routing"] - schema["requests"])]
+                for m in sorted(need["routing"] - schema["requests"]) if not m.startswith(INTERNAL)]
     return {"ok": not missing, "missing": missing, "warnings": warnings,
             "relied_on": {k: sorted(v) for k, v in need.items() if v},
             "schema_counts": {k: len(v) for k, v in schema.items()}}
@@ -144,13 +248,16 @@ def check(bridge_src, schema):
 def run(bridge=BRIDGE, codex=None):
     codex = codex or os.environ.get("CODEX_BIN", DEFAULT_CODEX)
     rep = {"codex_bin": codex, "codex_version": codex_version(codex)}
-    with tempfile.TemporaryDirectory(prefix="bridge-doctor-") as d:
-        try:
+    try:
+        source = Path(bridge).read_text()
+        # Valida la fuente antes de ejecutar el generador; nunca la importa.
+        _validate_source(relied_on(source))
+        with tempfile.TemporaryDirectory(prefix="bridge-doctor-") as d:
             schema = schema_methods(codex, d)
-        except Exception as e:
-            rep.update(ok=False, missing=None, error=str(e), daemon=daemon_state(codex))
-            return rep, 2
-    rep.update(check(Path(bridge).read_text(), schema))
+        rep.update(check(source, schema))
+    except Exception as e:
+        rep.update(ok=False, missing=None, error=str(e), daemon=daemon_state(codex))
+        return rep, 2
     rep["daemon"] = daemon_state(codex)
     return rep, 0 if rep["ok"] else 1
 
